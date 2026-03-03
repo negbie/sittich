@@ -182,4 +182,6 @@ dockers:
       - "--label=org.opencontainers.image.revision={{ .FullCommit }}"
       - "--label=org.opencontainers.image.version={{ .Version }}"
     extra_files:
-      - .tmp-libbundle/current/linux_amd64/
+      - .tmp-libbundle/current/linux_amd64/libonnxruntime.so
+      - .tmp-libbundle/current/linux_amd64/libsherpa-onnx-c-api.so
+      - .tmp-libbundle/current/linux_amd64/libsherpa-onnx-cxx-api.so
