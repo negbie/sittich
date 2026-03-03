@@ -161,3 +161,25 @@ aurs:
       # Symlink binary to /usr/bin/
       install -dm755 "${pkgdir}/usr/bin"
       ln -sf "/opt/chough/chough" "${pkgdir}/usr/bin/chough"
+
+# Docker images (v1 - stable)
+dockers:
+  - id: chough
+    goos: linux
+    goarch: amd64
+    ids:
+      - linux-amd64
+    image_templates:
+      - "ghcr.io/hyperpuncher/chough:latest"
+      - "ghcr.io/hyperpuncher/chough:{{ .Tag }}"
+      - "ghcr.io/hyperpuncher/chough:v{{ .Major }}"
+      - "ghcr.io/hyperpuncher/chough:v{{ .Major }}.{{ .Minor }}"
+    dockerfile: Dockerfile.goreleaser
+    build_flag_templates:
+      - "--pull"
+      - "--label=org.opencontainers.image.created={{ .Date }}"
+      - "--label=org.opencontainers.image.title={{ .ProjectName }}"
+      - "--label=org.opencontainers.image.revision={{ .FullCommit }}"
+      - "--label=org.opencontainers.image.version={{ .Version }}"
+    extra_files:
+      - .tmp-libbundle/current/linux_amd64/

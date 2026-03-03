@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write
+  packages: write
 
 jobs:
   release:
@@ -26,6 +27,13 @@ jobs:
       - name: Test
         run: go test ./...
 
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Release with goreleaser-cross
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -36,6 +44,7 @@ jobs:
             -e GITHUB_TOKEN="$GITHUB_TOKEN" \
             -e GH_PAT="$GH_PAT" \
             -e AUR_KEY="$AUR_KEY" \
+            -v /var/run/docker.sock:/var/run/docker.sock \
             -v "$PWD":/work \
             -w /work \
             --entrypoint /bin/sh \
