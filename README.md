@@ -70,17 +70,21 @@ chough -f json podcast.mp3 > transcript.json
 
 # Smaller chunks for lower memory usage
 chough -c 30 long-interview.wav
+
+# Use remote server mode (requires CHOUGH_URL)
+CHOUGH_URL=http://localhost:8080 chough --remote audio.mp3
 ```
 
 ### Flags
 
-| Flag               | Description                    | Default |
-| ------------------ | ------------------------------ | ------- |
-| `-c, --chunk-size` | Chunk size in seconds          | 60      |
-| `-f, --format`     | Output format: text, json, vtt | text    |
-| `-o, --output`     | Output file                    | stdout  |
-| `--version`        | Show version                   | -       |
-| `-h, --help`       | Show help                      | -       |
+| Flag               | Description                      | Default |
+| ------------------ | -------------------------------- | ------- |
+| `-c, --chunk-size` | Chunk size in seconds            | 60      |
+| `-f, --format`     | Output format: text, json, vtt   | text    |
+| `-o, --output`     | Output file                      | stdout  |
+| `-r, --remote`     | Transcribe via CHOUGH_URL server | -       |
+| `--version`        | Show version                     | -       |
+| `-h, --help`       | Show help                        | -       |
 
 ## Server Mode
 
@@ -148,6 +152,7 @@ docker-compose up -d
 ## Environment
 
 - `CHOUGH_MODEL`: Path to model directory (optional, auto-downloaded if not set)
+- `CHOUGH_URL`: Remote server URL for `--remote` mode (must start with `http://` or `https://`)
 
 ## Model
 

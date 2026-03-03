@@ -35,31 +35,52 @@ func run(args []string) error {
 		return runServer(&opts)
 	}
 
-	// CLI mode
-	recognizer, err := loadRecognizer()
-	if err != nil {
-		return err
+	var (
+		results  []ChunkResult
+		duration float64
+	)
+
+	if opts.RemoteMode {
+		serverURL, err := resolveRemoteURL()
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(os.Stderr, "mode: %sremote%s %s•%s url: %s\n", cyan, reset, dim, reset, serverURL)
+		fmt.Fprintf(os.Stderr, "audio: %s %s•%s chunks: %ds %s•%s format: %s\n", opts.AudioFile, dim, reset, opts.ChunkSize, dim, reset, opts.Format)
+
+		results, duration, err = transcribeRemote(serverURL, opts.AudioFile, opts.ChunkSize)
+		if err != nil {
+			return err
+		}
+	} else {
+		fmt.Fprintf(os.Stderr, "mode: %slocal%s\n", cyan, reset)
+
+		recognizer, err := loadRecognizer()
+		if err != nil {
+			return err
+		}
+		defer recognizer.Close()
+
+		duration, err = probeDuration(opts.AudioFile)
+		if err != nil {
+			return fmt.Errorf("failed to get duration: %w", err)
+		}
+
+		boundaries := buildBoundaries(duration, opts.ChunkSize)
+		fmt.Fprintf(os.Stderr, "audio: %.1fs %s•%s chunks: %ds %s•%s format: %s\n",
+			duration, dim, reset, opts.ChunkSize, dim, reset, opts.Format)
+
+		var elapsed time.Duration
+		results, elapsed = transcribeAudio(recognizer, opts.AudioFile, boundaries)
+
+		rtFactor := duration / elapsed.Seconds()
+		rtColor := green
+		if rtFactor < 10 {
+			rtColor = yellow
+		}
+		fmt.Fprintf(os.Stderr, "%s⚡%s Processed in %s%.1fs%s %s(%s%.1fx%s realtime)%s\n\n",
+			yellow, reset, bold, elapsed.Seconds(), reset, dim, rtColor, rtFactor, reset, reset)
 	}
-	defer recognizer.Close()
-
-	duration, err := probeDuration(opts.AudioFile)
-	if err != nil {
-		return fmt.Errorf("failed to get duration: %w", err)
-	}
-
-	boundaries := buildBoundaries(duration, opts.ChunkSize)
-	fmt.Fprintf(os.Stderr, "audio: %.1fs %s•%s chunks: %ds %s•%s format: %s\n",
-		duration, dim, reset, opts.ChunkSize, dim, reset, opts.Format)
-
-	results, elapsed := transcribeAudio(recognizer, opts.AudioFile, boundaries)
-
-	rtFactor := duration / elapsed.Seconds()
-	rtColor := green
-	if rtFactor < 10 {
-		rtColor = yellow
-	}
-	fmt.Fprintf(os.Stderr, "%s⚡%s Processed in %s%.1fs%s %s(%s%.1fx%s realtime)%s\n\n",
-		yellow, reset, bold, elapsed.Seconds(), reset, dim, rtColor, rtFactor, reset, reset)
 
 	out, closeFn, err := openOutput(opts.OutputFile)
 	if err != nil {

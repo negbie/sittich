@@ -33,6 +33,7 @@ type cliOptions struct {
 	Format      string
 	OutputFile  string
 	ShowVersion bool
+	RemoteMode  bool
 
 	// Server mode
 	ServerMode  bool
@@ -60,6 +61,7 @@ var usageFlags = []cliFlag{
 	{short: "c", long: "chunk-size", arg: "int", description: "chunk size in seconds", defaultVal: "60"},
 	{short: "f", long: "format", arg: "string", description: "output format: text, json, vtt", defaultVal: "text"},
 	{short: "o", long: "output", arg: "file", description: "output file", defaultVal: "stdout"},
+	{short: "r", long: "remote", description: "transcribe via remote server using CHOUGH_URL"},
 	{long: "version", description: "show version"},
 }
 
@@ -108,6 +110,8 @@ func parseCLI(args []string) (cliOptions, error) {
 	outputFile := fs.String("o", "", "output file")
 	fs.StringVar(outputFile, "output", "", "output file")
 	showVersion := fs.Bool("version", false, "show version")
+	remoteMode := fs.Bool("r", false, "transcribe via remote server using CHOUGH_URL")
+	fs.BoolVar(remoteMode, "remote", false, "transcribe via remote server using CHOUGH_URL")
 
 	// Server flags
 	serverMode := fs.Bool("server", false, "run in server mode")
@@ -132,6 +136,7 @@ func parseCLI(args []string) (cliOptions, error) {
 		Format:      strings.ToLower(*format),
 		OutputFile:  *outputFile,
 		ShowVersion: *showVersion,
+		RemoteMode:  *remoteMode,
 		ServerMode:  *serverMode,
 		ServerHost:  *serverHost,
 		ServerPort:  *serverPort,
@@ -244,6 +249,7 @@ func printUsage() {
 	exampleRows := []usageRow{
 		{label: fmt.Sprintf("%s$%s chough audio.mp3", green, reset), plainLabel: "$ chough audio.mp3", desc: fmt.Sprintf("%s# 60s chunks, text output%s", dim, reset)},
 		{label: fmt.Sprintf("%s$%s chough -c 30 talk.mp3", green, reset), plainLabel: "$ chough -c 30 talk.mp3", desc: fmt.Sprintf("%s# 30s chunks%s", dim, reset)},
+		{label: fmt.Sprintf("%s$%s CHOUGH_URL=http://localhost:8080 chough -r audio.mp3", green, reset), plainLabel: "$ CHOUGH_URL=http://localhost:8080 chough -r audio.mp3", desc: fmt.Sprintf("%s# transcribe via remote server%s", dim, reset)},
 		{label: fmt.Sprintf("%s$%s chough -f vtt -o subs.vtt audio.mp3", green, reset), plainLabel: "$ chough -f vtt -o subs.vtt audio.mp3", desc: fmt.Sprintf("%s# WebVTT to file%s", dim, reset)},
 		{label: fmt.Sprintf("%s$%s chough --server --port 8080", green, reset), plainLabel: "$ chough --server --port 8080", desc: fmt.Sprintf("%s# Run server on port 8080%s", dim, reset)},
 	}
@@ -253,6 +259,7 @@ func printUsage() {
 	fmt.Fprintf(os.Stderr, "%sEnvironment:%s\n", bold, reset)
 	envRows := []usageRow{
 		{label: fmt.Sprintf("%sCHOUGH_MODEL%s", cyan, reset), plainLabel: "CHOUGH_MODEL", desc: fmt.Sprintf("path to model dir %s(optional, auto-downloaded if not set)%s", dim, reset)},
+		{label: fmt.Sprintf("%sCHOUGH_URL%s", cyan, reset), plainLabel: "CHOUGH_URL", desc: fmt.Sprintf("remote server URL %s(required with --remote, must start with http:// or https://)%s", dim, reset)},
 	}
 	printAlignedRows(envRows)
 }
