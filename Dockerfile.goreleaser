@@ -3,17 +3,13 @@ FROM debian:stable-slim
 # Install ffmpeg and ca-certificates
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg ca-certificates && rm -rf /var/lib/apt/lists/*
 
-# Copy binary and libraries from build context
-# GoReleaser v1 places files directly in context root
-COPY chough /usr/local/bin/chough
-COPY *.so /usr/local/lib/
-
-# Set library path
-ENV LD_LIBRARY_PATH=/usr/local/lib
+# Copy binary and libraries to /opt/chough/
+# Binary has rpath=$ORIGIN, so it looks for libs in same directory
+COPY chough *.so /opt/chough/
 
 # Expose server port
 EXPOSE 8080
 
 # Run server
-ENTRYPOINT ["chough"]
+ENTRYPOINT ["/opt/chough/chough"]
 CMD ["--server", "--host", "0.0.0.0", "--port", "8080"]
