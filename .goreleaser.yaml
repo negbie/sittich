@@ -55,7 +55,7 @@ builds:
 
   - id: windows-amd64
     main: ./cmd/chough
-    binary: chough
+    binary: chough-bin
     goos: [windows]
     goarch: [amd64]
     env:
@@ -65,9 +65,20 @@ builds:
     ldflags:
       - -s -w -X main.version={{ .Tag }}
 
+  - id: windows-shim-amd64
+    main: ./cmd/chough-shim
+    binary: chough
+    goos: [windows]
+    goarch: [amd64]
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - -s -w -X main.version={{ .Tag }}
+
 archives:
   - name_template: >-
       {{ .ProjectName }}_{{ .Tag }}_{{ .Os }}_{{- if eq .Arch "amd64" -}}x86_64{{- else -}}{{ .Arch }}{{- end -}}
+    allow_different_binary_count: true
     formats: [tar.gz]
     format_overrides:
       - goos: windows
