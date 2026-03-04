@@ -139,9 +139,6 @@ func transcribeAudio(recognizer *asr.Recognizer, audioFile string, boundaries []
 	for i := 0; i < total; i++ {
 		chunkStart := boundaries[i]
 		chunkEnd := boundaries[i+1]
-		if chunkEnd-chunkStart < 0.5 {
-			continue
-		}
 
 		elapsed := time.Since(startTime)
 		percent := float64(i+1) / float64(total)
