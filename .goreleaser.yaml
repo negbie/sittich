@@ -107,7 +107,6 @@ homebrew_casks:
       branch: main
       token: "{{ .Env.GH_PAT }}"
     directory: Casks
-    skip_upload: false
     hooks:
       post:
         install: |
@@ -126,6 +125,8 @@ winget:
     license: MIT
     license_url: https://github.com/hyperpuncher/chough/blob/main/LICENSE
     tags: [asr, transcription, speech-to-text, cli]
+    dependencies:
+      - package_identifier: Gyan.FFmpeg.Essentials
     repository:
       owner: hyperpuncher
       name: winget-pkgs
@@ -138,7 +139,6 @@ winget:
           owner: microsoft
           name: winget-pkgs
           branch: master
-    skip_upload: auto
 
 aurs:
   - name: chough-bin
