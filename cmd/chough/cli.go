@@ -149,9 +149,15 @@ func parseCLI(args []string) (cliOptions, error) {
 	}
 
 	if fs.NArg() < 1 {
-		return cliOptions{}, fmt.Errorf("%w: audio file is required", errInvalidArgs)
+		// Check if stdin has data for pipe mode
+		stat, err := os.Stdin.Stat()
+		if err != nil || (stat.Mode()&os.ModeCharDevice) != 0 {
+			return cliOptions{}, fmt.Errorf("%w: audio file is required (or pipe audio to stdin)", errInvalidArgs)
+		}
+		opts.AudioFile = "-"
+	} else {
+		opts.AudioFile = fs.Arg(0)
 	}
-	opts.AudioFile = fs.Arg(0)
 
 	switch opts.Format {
 	case "text", "json", "vtt":
@@ -206,7 +212,8 @@ func printUsage() {
 	fmt.Fprintf(os.Stderr, "%s🐦‍⬛ %schough%s\n\n", bold, magenta, reset)
 
 	fmt.Fprintf(os.Stderr, "%sCLI Usage:%s\n", bold, reset)
-	fmt.Fprintln(os.Stderr, "  chough [flags] <audio-file>")
+	fmt.Fprintln(os.Stderr, "  chough [flags] [audio-file]")
+	fmt.Fprintln(os.Stderr, "  cat audio | chough [flags]")
 	fmt.Fprintln(os.Stderr)
 
 	fmt.Fprintf(os.Stderr, "%sCLI Flags:%s\n", bold, reset)
@@ -248,6 +255,7 @@ func printUsage() {
 	fmt.Fprintf(os.Stderr, "%sExamples:%s\n", bold, reset)
 	exampleRows := []usageRow{
 		{label: fmt.Sprintf("%s$%s chough audio.mp3", green, reset), plainLabel: "$ chough audio.mp3", desc: fmt.Sprintf("%s# 60s chunks, text output%s", dim, reset)},
+		{label: fmt.Sprintf("%s$%s cat audio.mp3 | chough", green, reset), plainLabel: "$ cat audio.mp3 | chough", desc: fmt.Sprintf("%s# transcribe from pipe%s", dim, reset)},
 		{label: fmt.Sprintf("%s$%s chough -c 30 talk.mp3", green, reset), plainLabel: "$ chough -c 30 talk.mp3", desc: fmt.Sprintf("%s# 30s chunks%s", dim, reset)},
 		{label: fmt.Sprintf("%s$%s CHOUGH_URL=http://localhost:8080 chough -r audio.mp3", green, reset), plainLabel: "$ CHOUGH_URL=http://localhost:8080 chough -r audio.mp3", desc: fmt.Sprintf("%s# transcribe via remote server%s", dim, reset)},
 		{label: fmt.Sprintf("%s$%s chough -f vtt -o subs.vtt audio.mp3", green, reset), plainLabel: "$ chough -f vtt -o subs.vtt audio.mp3", desc: fmt.Sprintf("%s# WebVTT to file%s", dim, reset)},

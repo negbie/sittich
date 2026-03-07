@@ -62,6 +62,9 @@ npx skills add hyperpuncher/dotagents --skill chough
 # Basic transcription (text to stdout)
 chough audio.mp3
 
+# Pipe audio from stdin
+cat audio.mp3 | chough
+
 # Video files work too - extracts audio automatically
 chough -f vtt -o subtitles.vtt lecture.mp4
 

@@ -39,6 +39,18 @@ func run(args []string) error {
 		return runServer(&opts)
 	}
 
+	// Handle stdin input by copying to temp file
+	audioFile := opts.AudioFile
+	var tempFile string
+	if opts.AudioFile == "-" {
+		tempFile, err = copyStdinToTemp()
+		if err != nil {
+			return fmt.Errorf("failed to read stdin: %w", err)
+		}
+		audioFile = tempFile
+		defer os.Remove(tempFile)
+	}
+
 	var (
 		results  []types.ChunkResult
 		duration float64
@@ -50,9 +62,13 @@ func run(args []string) error {
 			return err
 		}
 		fmt.Fprintf(os.Stderr, "mode: %sremote%s %s•%s url: %s\n", cyan, reset, dim, reset, serverURL)
-		fmt.Fprintf(os.Stderr, "audio: %s %s•%s chunks: %ds %s•%s format: %s\n", opts.AudioFile, dim, reset, opts.ChunkSize, dim, reset, opts.Format)
+		srcInfo := opts.AudioFile
+		if srcInfo == "-" {
+			srcInfo = "stdin"
+		}
+		fmt.Fprintf(os.Stderr, "audio: %s %s•%s chunks: %ds %s•%s format: %s\n", srcInfo, dim, reset, opts.ChunkSize, dim, reset, opts.Format)
 
-		results, duration, err = transcribeRemote(serverURL, opts.AudioFile, opts.ChunkSize)
+		results, duration, err = transcribeRemote(serverURL, audioFile, opts.ChunkSize)
 		if err != nil {
 			return err
 		}
@@ -65,7 +81,7 @@ func run(args []string) error {
 		}
 		defer recognizer.Close()
 
-		duration, err = audio.ProbeDuration(opts.AudioFile)
+		duration, err = audio.ProbeDuration(audioFile)
 		if err != nil {
 			return fmt.Errorf("failed to get duration: %w", err)
 		}
@@ -75,7 +91,7 @@ func run(args []string) error {
 			duration, dim, reset, opts.ChunkSize, dim, reset, opts.Format)
 
 		var elapsed time.Duration
-		results, elapsed = transcribeAudio(recognizer, opts.AudioFile, boundaries)
+		results, elapsed = transcribeAudio(recognizer, audioFile, boundaries)
 
 		rtFactor := duration / elapsed.Seconds()
 		rtColor := green
@@ -181,4 +197,20 @@ func transcribeChunk(recognizer *asr.Recognizer, audioFile string, start, durati
 	}
 
 	return recognizer.Transcribe(chunkFile)
+}
+
+// copyStdinToTemp reads all data from stdin and writes it to a temporary file.
+// Returns the path to the temp file which the caller must clean up.
+func copyStdinToTemp() (string, error) {
+	tmpFile, err := os.CreateTemp("", "chough-stdin-*")
+	if err != nil {
+		return "", fmt.Errorf("failed to create temp file: %w", err)
+	}
+	defer tmpFile.Close()
+
+	if _, err := io.Copy(tmpFile, os.Stdin); err != nil {
+		return "", fmt.Errorf("failed to copy stdin: %w", err)
+	}
+
+	return tmpFile.Name(), nil
 }
