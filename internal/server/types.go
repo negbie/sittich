@@ -1,10 +1,10 @@
 package server
 
 import (
+	"context"
 	"time"
 
-	"github.com/hyperpuncher/chough/internal/asr"
-	"github.com/hyperpuncher/chough/internal/types"
+	"github.com/negbie/sittich/internal/types"
 )
 
 // Job represents a transcription job
@@ -16,6 +16,7 @@ type Job struct {
 	Result    chan JobResult
 	Error     chan error
 	StartTime time.Time
+	Ctx       context.Context
 }
 
 // JobResult holds the result of a transcription job
@@ -24,7 +25,7 @@ type JobResult struct {
 	ProcessingTime float64
 	RealtimeFactor float64
 	Text           string
-	Chunks         []types.ChunkResult
+	Segments       []types.Segment
 }
 
 // TranscribeRequest represents a transcription request
@@ -37,13 +38,13 @@ type TranscribeRequest struct {
 
 // TranscribeResponse represents a transcription response
 type TranscribeResponse struct {
-	Success        bool                `json:"success"`
-	Error          string              `json:"error,omitempty"`
-	Duration       float64             `json:"duration_seconds"`
-	ProcessingTime float64             `json:"processing_time_seconds"`
-	RealtimeFactor float64             `json:"realtime_factor"`
-	Text           string              `json:"text"`
-	Chunks         []types.ChunkResult `json:"chunks,omitempty"`
+	Success        bool            `json:"success"`
+	Error          string          `json:"error,omitempty"`
+	Duration       float64         `json:"duration_seconds"`
+	ProcessingTime float64         `json:"processing_time_seconds"`
+	RealtimeFactor float64         `json:"realtime_factor"`
+	Text           string          `json:"text"`
+	Segments       []types.Segment `json:"segments,omitempty"`
 }
 
 // HealthResponse represents a health check response
@@ -64,6 +65,7 @@ type ServerOptions struct {
 	MaxUploadMB  int64
 	Workers      int
 	MaxQueueSize int
+	Debug        bool
 }
 
 // DefaultServerOptions returns default server options
@@ -88,6 +90,6 @@ type RecognizerPool interface {
 
 // Recognizer is the interface for ASR recognizer
 type Recognizer interface {
-	Transcribe(audioPath string) (*asr.Result, error)
-	Close()
+	Transcribe(ctx context.Context, audio []float32, sampleRate int, opts types.Options) (*types.Result, error)
+	Close() error
 }

@@ -1,18 +1,26 @@
 package asr
 
 import (
+	"context"
 	"fmt"
+	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 
-	"github.com/hyperpuncher/chough/internal/audio"
-	"github.com/hyperpuncher/chough/internal/models"
 	sherpa "github.com/k2-fsa/sherpa-onnx-go/sherpa_onnx"
+	"github.com/negbie/sittich/internal/models"
+	"github.com/negbie/sittich/internal/types"
 )
 
-// Recognizer wraps Sherpa-ONNX recognizer with proper cleanup
+// Recognizer wraps Sherpa-ONNX recognizer with thread-safe access and proper cleanup.
 type Recognizer struct {
 	Config     *Config
 	recognizer *sherpa.OfflineRecognizer
+	mu         sync.Mutex
+	cond       *sync.Cond
+	active     int
+	closed     bool
 }
 
 // NewRecognizer creates a new ASR recognizer
@@ -33,6 +41,8 @@ func NewRecognizer(cfg *Config) (*Recognizer, error) {
 			Provider:   cfg.Provider,
 			ModelType:  "nemo_transducer",
 		},
+		DecodingMethod: cfg.DecodingMethod,
+		MaxActivePaths: cfg.MaxActivePaths,
 	}
 
 	recognizer := sherpa.NewOfflineRecognizer(&sherpaConfig)
@@ -40,56 +50,139 @@ func NewRecognizer(cfg *Config) (*Recognizer, error) {
 		return nil, fmt.Errorf("failed to create recognizer")
 	}
 
-	return &Recognizer{
+	r := &Recognizer{
 		Config:     cfg,
 		recognizer: recognizer,
-	}, nil
+	}
+	r.cond = sync.NewCond(&r.mu)
+
+	return r, nil
 }
 
-// Transcribe transcribes an audio file
-func (r *Recognizer) Transcribe(audioPath string) (*Result, error) {
-	if r == nil || r.recognizer == nil {
-		return nil, fmt.Errorf("recognizer not initialized")
+// Transcribe handles raw PCM samples for the pipeline. It is thread-safe and
+// allows concurrent Decode calls on independent streams while preventing Close
+// from freeing the recognizer during in-flight work.
+func (r *Recognizer) Transcribe(ctx context.Context, audio []float32, sampleRate int, opts types.Options) (*types.Result, error) {
+	if r == nil {
+		return nil, fmt.Errorf("recognizer is nil")
 	}
 
-	// Read wave file using pure Go implementation (no C memory leaks!)
-	wave, err := audio.ReadWave(audioPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read wave file: %w", err)
+	// Check if context is already dead
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
-	// Create stream with EXPLICIT cleanup via defer
+	r.mu.Lock()
+	if r.closed || r.recognizer == nil {
+		r.mu.Unlock()
+		return nil, fmt.Errorf("recognizer already closed")
+	}
+
 	stream := sherpa.NewOfflineStream(r.recognizer)
-	defer sherpa.DeleteOfflineStream(stream) // ← KEY: prevents memory leak!
+	if stream == nil {
+		r.mu.Unlock()
+		return nil, fmt.Errorf("failed to create offline stream")
+	}
+
+	r.active++
+	r.mu.Unlock()
+
+	defer func() {
+		sherpa.DeleteOfflineStream(stream)
+
+		r.mu.Lock()
+		r.active--
+		if r.active == 0 {
+			r.cond.Broadcast()
+		}
+		r.mu.Unlock()
+	}()
 
 	// Process audio
-	stream.AcceptWaveform(wave.SampleRate, wave.Samples)
+	stream.AcceptWaveform(sampleRate, audio)
 	r.recognizer.Decode(stream)
 
 	// Get result
 	sherpaResult := stream.GetResult()
 	if sherpaResult == nil {
-		return &Result{Text: ""}, nil
+		if opts.Debug {
+			fmt.Fprintf(os.Stderr, "   [Recognizer] empty_result=nil sample_rate=%d samples=%d\n", sampleRate, len(audio))
+		}
+		return &types.Result{}, nil
+	}
+	if opts.Debug {
+		textLen := len(strings.TrimSpace(sherpaResult.Text))
+		fmt.Fprintf(os.Stderr, "   [Recognizer] result_text_len=%d tokens=%d timestamps=%d\n", textLen, len(sherpaResult.Tokens), len(sherpaResult.Timestamps))
+		if textLen == 0 {
+			fmt.Fprintf(os.Stderr, "   [Recognizer] empty_result=text sample_rate=%d samples=%d\n", sampleRate, len(audio))
+		}
 	}
 
-	return &Result{
-		Text:       sherpaResult.Text,
-		Timestamps: sherpaResult.Timestamps,
-		Tokens:     sherpaResult.Tokens,
-	}, nil
+	// Convert to internal types
+	result := &types.Result{
+		Duration: float64(len(audio)) / float64(sampleRate),
+	}
+
+	result.Segments = []types.Segment{
+		{
+			ID:    0,
+			Start: 0,
+			End:   result.Duration,
+			Text:  sherpaResult.Text,
+		},
+	}
+
+	// Map timestamps if available
+	if len(sherpaResult.Timestamps) > 0 {
+		result.Segments[0].Words = make([]types.Word, len(sherpaResult.Tokens))
+		for i, token := range sherpaResult.Tokens {
+			if i < len(sherpaResult.Timestamps) {
+				result.Segments[0].Words[i] = types.Word{
+					Word:  token,
+					Start: float64(sherpaResult.Timestamps[i]),
+					End:   float64(sherpaResult.Timestamps[i]) + 0.1,
+				}
+			}
+		}
+	}
+
+	return result, nil
 }
 
-// Close cleans up the recognizer
-func (r *Recognizer) Close() {
+// SupportedLanguages returns empty (auto-detect or as directed by model).
+func (r *Recognizer) SupportedLanguages() []string {
+	return nil
+}
+
+// ModelName returns the configured model path's basename.
+func (r *Recognizer) ModelName() string {
+	return filepath.Base(r.Config.ModelPath)
+}
+
+// Close cleans up the recognizer native resources. It is thread-safe,
+// prevents double-deletion of native objects, and waits for in-flight
+// transcriptions to finish before freeing the underlying recognizer.
+func (r *Recognizer) Close() error {
+	if r == nil {
+		return nil
+	}
+
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return nil
+	}
+
+	r.closed = true
+	for r.active > 0 {
+		r.cond.Wait()
+	}
+
 	if r.recognizer != nil {
 		sherpa.DeleteOfflineRecognizer(r.recognizer)
 		r.recognizer = nil
 	}
-}
+	r.mu.Unlock()
 
-// Result holds transcription result
-type Result struct {
-	Text       string
-	Timestamps []float32
-	Tokens     []string
+	return nil
 }

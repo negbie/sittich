@@ -9,32 +9,46 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/hyperpuncher/chough/internal/asr"
-	"github.com/hyperpuncher/chough/internal/audio"
-	"github.com/hyperpuncher/chough/internal/server"
-	"github.com/hyperpuncher/chough/internal/types"
+	"github.com/negbie/sittich/internal/asr"
+	"github.com/negbie/sittich/internal/models"
+	"github.com/negbie/sittich/internal/pipeline"
+	"github.com/negbie/sittich/internal/server"
 )
 
-// Pool manages a pool of transcription workers
+// Pool manages a pool of transcription workers. Each worker has its own
+// private Pipeline/VAD instance to process audio in isolation.
 type Pool struct {
-	workers    int
-	queue      chan *server.Job
-	recognizer *asr.Recognizer
-	ctx        context.Context
-	cancel     context.CancelFunc
-	wg         sync.WaitGroup
-	busyCount  atomic.Int32
+	workers      int
+	queue        chan *server.Job
+	recognizer   *asr.Recognizer
+	vadModelPath string
+	vadEnabled   bool
+	ctx          context.Context
+	cancel       context.CancelFunc
+	wg           sync.WaitGroup
+	busyCount    atomic.Int32
+	debug        bool
+	shutdownOnce sync.Once
 }
 
 // NewPool creates a new worker pool
-func NewPool(workers int, queueSize int, recognizer *asr.Recognizer) *Pool {
+func NewPool(workers int, queueSize int, recognizer *asr.Recognizer, debug bool, vadEnabled bool) *Pool {
 	ctx, cancel := context.WithCancel(context.Background())
+
+	vadPath := ""
+	if vadEnabled {
+		vadPath, _ = models.GetVADPath()
+	}
+
 	p := &Pool{
-		workers:    workers,
-		queue:      make(chan *server.Job, queueSize),
-		recognizer: recognizer,
-		ctx:        ctx,
-		cancel:     cancel,
+		workers:      workers,
+		queue:        make(chan *server.Job, queueSize),
+		recognizer:   recognizer,
+		vadModelPath: vadPath,
+		vadEnabled:   vadEnabled,
+		ctx:          ctx,
+		cancel:       cancel,
+		debug:        debug,
 	}
 
 	// Start workers
@@ -46,7 +60,6 @@ func NewPool(workers int, queueSize int, recognizer *asr.Recognizer) *Pool {
 	return p
 }
 
-// Submit adds a job to the queue
 func (p *Pool) Submit(job *server.Job) error {
 	select {
 	case p.queue <- job:
@@ -56,30 +69,46 @@ func (p *Pool) Submit(job *server.Job) error {
 	}
 }
 
-// QueueSize returns the current queue size
 func (p *Pool) QueueSize() int {
 	return len(p.queue)
 }
 
-// BusyWorkers returns the number of busy workers
 func (p *Pool) BusyWorkers() int {
 	return int(p.busyCount.Load())
 }
 
-// TotalWorkers returns the total number of workers
 func (p *Pool) TotalWorkers() int {
 	return p.workers
 }
 
-// Shutdown stops all workers
 func (p *Pool) Shutdown() {
-	p.cancel()
-	close(p.queue)
-	p.wg.Wait()
+	p.shutdownOnce.Do(func() {
+		p.cancel()
+		close(p.queue)
+		p.wg.Wait()
+
+		// Explicitly close the shared recognizer once all workers are done
+		if p.recognizer != nil {
+			p.recognizer.Close()
+		}
+	})
 }
 
 func (p *Pool) worker(id int) {
 	defer p.wg.Done()
+
+	// 1. Initialise a private Pipeline for this worker.
+	pipe, err := pipeline.NewPipeline(p.recognizer, pipeline.PipelineConfig{
+		VADEnabled:    p.vadEnabled && p.vadModelPath != "",
+		VADModelPath:  p.vadModelPath,
+		ChunkDuration: pipeline.DefaultChunkDuration,
+		Debug:         p.debug,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Worker %d: failed to initialise pipeline: %v\n", id, err)
+		return
+	}
+	defer pipe.Close()
 
 	for {
 		select {
@@ -89,94 +118,64 @@ func (p *Pool) worker(id int) {
 			if !ok {
 				return
 			}
-			p.processJob(job)
+			p.processJobWithPipeline(id, job, pipe)
 		}
 	}
 }
 
-func (p *Pool) processJob(job *server.Job) {
+func (p *Pool) processJobWithPipeline(workerID int, job *server.Job, pipe *pipeline.Pipeline) {
 	p.busyCount.Add(1)
 	defer p.busyCount.Add(-1)
 
-	// Clean up temp file after processing (the original input file)
+	if p.debug {
+		queueWait := time.Since(job.StartTime).Round(time.Millisecond)
+		fileName := filepath.Base(job.FilePath)
+		if fileName == "." || fileName == string(filepath.Separator) {
+			fileName = "<memory>"
+		}
+		fmt.Fprintf(os.Stderr, "[Worker %d] Job %s start file=%s queue_wait=%s\n", workerID, job.ID, fileName, queueWait)
+	}
+
 	if job.FilePath != "" {
 		defer os.Remove(job.FilePath)
 	}
 
 	startTime := time.Now()
 
-	// Get audio duration
-	duration, err := audio.ProbeDuration(job.FilePath)
+	result, err := pipe.Process(job.Ctx, job.FilePath)
 	if err != nil {
-		job.Error <- fmt.Errorf("failed to probe audio: %w", err)
+		if p.debug {
+			fmt.Fprintf(os.Stderr, "[Worker %d] Job %s failed processing_time=%s err=%v\n", workerID, job.ID, time.Since(startTime).Round(time.Millisecond), err)
+		}
+		select {
+		case job.Error <- fmt.Errorf("pipeline processing failed: %w", err):
+		case <-job.Ctx.Done():
+		case <-p.ctx.Done():
+		}
 		return
 	}
 
-	// Build boundaries for chunking
-	boundaries := audio.BuildBoundaries(duration, job.ChunkSize)
-	results := make([]types.ChunkResult, 0, len(boundaries)-1)
-
-	// Process chunks
-	for i := 0; i < len(boundaries)-1; i++ {
-		chunkStart := boundaries[i]
-		chunkEnd := boundaries[i+1]
-
-		if chunkEnd-chunkStart < 0.5 {
-			continue
-		}
-
-		result, err := p.transcribeChunk(job.FilePath, chunkStart, chunkEnd-chunkStart)
-		if err != nil {
-			job.Error <- fmt.Errorf("failed to transcribe chunk %d: %w", i+1, err)
-			return
-		}
-
-		results = append(results, types.ChunkResult{
-			StartTime:  chunkStart,
-			EndTime:    chunkEnd,
-			Text:       result.Text,
-			Timestamps: result.Timestamps,
-			Tokens:     result.Tokens,
-		})
-	}
-
-	// Build full text
-	fullText := ""
-	for _, r := range results {
-		if r.Text != "" {
-			if fullText != "" {
-				fullText += " "
-			}
-			fullText += r.Text
-		}
-	}
-
 	processingTime := time.Since(startTime).Seconds()
-	rtFactor := duration / processingTime
+	rtFactor := result.Duration / processingTime
 	if rtFactor < 0 {
 		rtFactor = 0
 	}
 
-	job.Result <- server.JobResult{
-		Duration:       duration,
+	if p.debug {
+		processingElapsed := time.Since(startTime).Round(time.Millisecond)
+		totalElapsed := time.Since(job.StartTime).Round(time.Millisecond)
+		fmt.Fprintf(os.Stderr, "[Worker %d] Job %s done processing_time=%s total_time=%s rtf=%.2f\n", workerID, job.ID, processingElapsed, totalElapsed, rtFactor)
+	}
+
+	select {
+	case job.Result <- server.JobResult{
+		Duration:       result.Duration,
 		ProcessingTime: processingTime,
 		RealtimeFactor: rtFactor,
-		Text:           fullText,
-		Chunks:         results,
+		Text:           result.FullText(),
+		Segments:       result.Segments,
+	}:
+	case <-job.Ctx.Done():
+	case <-p.ctx.Done():
 	}
-}
-
-func (p *Pool) transcribeChunk(audioFile string, start, duration float64) (*asr.Result, error) {
-	tmpDir, err := os.MkdirTemp("", "chough-chunk-*")
-	if err != nil {
-		return nil, err
-	}
-	defer os.RemoveAll(tmpDir)
-
-	chunkFile := filepath.Join(tmpDir, "chunk.wav")
-	if err := audio.ExtractChunkWAV(audioFile, chunkFile, start, duration); err != nil {
-		return nil, err
-	}
-
-	return p.recognizer.Transcribe(chunkFile)
 }

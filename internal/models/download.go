@@ -19,29 +19,98 @@ const (
 	DecoderFile = "decoder.int8.onnx"
 	JoinerFile  = "joiner.int8.onnx"
 	TokensFile  = "tokens.txt"
+
+	VADModelName = "silero-vad"
+	VADModelURL  = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx"
+	VADFile      = "silero_vad.onnx"
 )
 
 var requiredModelFiles = []string{EncoderFile, DecoderFile, JoinerFile, TokensFile}
 
+// GetVADPath returns the path to the VAD model file, downloading if necessary
+func GetVADPath() (string, error) {
+	cacheDir := getCacheDir()
+	vadDir := filepath.Join(cacheDir, "sittich", "models", VADModelName)
+	vadPath := filepath.Join(vadDir, VADFile)
+
+	if _, err := os.Stat(vadPath); err == nil {
+		return vadPath, nil
+	}
+
+	fmt.Fprintf(os.Stderr, "Downloading VAD model to %s...\n", vadPath)
+	if err := os.MkdirAll(vadDir, 0755); err != nil {
+		return "", err
+	}
+
+	if err := downloadFile(VADModelURL, vadPath); err != nil {
+		return "", fmt.Errorf("failed to download VAD model: %w", err)
+	}
+
+	return vadPath, nil
+}
+
+// downloadFile downloads a single file from url to path
+func downloadFile(url, path string) error {
+	resp, err := http.Get(url)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("download failed: %s", resp.Status)
+	}
+
+	tmpPath := path + ".part"
+	out, err := os.Create(tmpPath)
+	if err != nil {
+		return err
+	}
+
+	if _, err := io.Copy(out, resp.Body); err != nil {
+		out.Close()
+		os.Remove(tmpPath)
+		return err
+	}
+
+	if err := out.Close(); err != nil {
+		os.Remove(tmpPath)
+		return err
+	}
+
+	if err := os.Rename(tmpPath, path); err != nil {
+		os.Remove(tmpPath)
+		return err
+	}
+
+	return nil
+}
+
 // GetModelPath returns the path to the model directory, downloading if necessary
 func GetModelPath() (string, error) {
-	// 1. Check CHOUGH_MODEL env var
-	if envPath := os.Getenv("CHOUGH_MODEL"); envPath != "" {
+	// 1. Prefer local ./data directory
+	localModelDir := "./data"
+	if isValidModel(localModelDir) {
+		return localModelDir, nil
+	}
+
+	// 2. Check sittich_MODEL env var
+	if envPath := os.Getenv("sittich_MODEL"); envPath != "" {
 		if isValidModel(envPath) {
 			return envPath, nil
 		}
-		fmt.Fprintf(os.Stderr, "Warning: CHOUGH_MODEL=%s not found or invalid\n", envPath)
+		fmt.Fprintf(os.Stderr, "Warning: sittich_MODEL=%s not found or invalid\n", envPath)
 	}
 
-	// 2. Check cache directory
+	// 3. Check cache directory
 	cacheDir := getCacheDir()
-	modelDir := filepath.Join(cacheDir, "chough", "models", DefaultModelName)
+	modelDir := filepath.Join(cacheDir, "sittich", "models", DefaultModelName)
 
 	if isValidModel(modelDir) {
 		return modelDir, nil
 	}
 
-	// 3. Download model
+	// 4. Download model
 	fmt.Fprintf(os.Stderr, "Downloading model to %s...\n", modelDir)
 	if err := downloadAndExtract(modelDir); err != nil {
 		return "", fmt.Errorf("failed to download model: %w", err)
@@ -71,7 +140,11 @@ func isValidModel(path string) bool {
 }
 
 func downloadAndExtract(targetDir string) error {
-	tmpFile, err := os.CreateTemp("", "chough-model-*.tar.bz2")
+	if err := os.MkdirAll(filepath.Dir(targetDir), 0755); err != nil {
+		return err
+	}
+
+	tmpFile, err := os.CreateTemp(filepath.Dir(targetDir), "sittich-model-*.tar.bz2")
 	if err != nil {
 		return err
 	}
@@ -80,11 +153,13 @@ func downloadAndExtract(targetDir string) error {
 
 	resp, err := http.Get(ModelURL)
 	if err != nil {
+		tmpFile.Close()
 		return err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		tmpFile.Close()
 		return fmt.Errorf("download failed: %s", resp.Status)
 	}
 
@@ -102,6 +177,7 @@ func downloadAndExtract(targetDir string) error {
 				written += int64(nw)
 			}
 			if werr != nil {
+				tmpFile.Close()
 				return werr
 			}
 			// Update progress every 5%
@@ -119,6 +195,7 @@ func downloadAndExtract(targetDir string) error {
 			break
 		}
 		if rerr != nil {
+			tmpFile.Close()
 			return rerr
 		}
 	}
@@ -127,10 +204,28 @@ func downloadAndExtract(targetDir string) error {
 	}
 	fmt.Fprintln(os.Stderr) // New line after progress
 
+	stagingDir := targetDir + ".tmp"
+	_ = os.RemoveAll(stagingDir)
+	if err := os.MkdirAll(stagingDir, 0755); err != nil {
+		return err
+	}
+
 	fmt.Fprintf(os.Stderr, "Extracting...\n")
 
-	if err := extractTarBz2(tmpPath, targetDir); err != nil {
+	if err := extractTarBz2(tmpPath, stagingDir); err != nil {
+		os.RemoveAll(stagingDir)
 		return fmt.Errorf("extraction failed: %w", err)
+	}
+
+	if !isValidModel(stagingDir) {
+		os.RemoveAll(stagingDir)
+		return fmt.Errorf("extraction failed: required model files missing")
+	}
+
+	_ = os.RemoveAll(targetDir)
+	if err := os.Rename(stagingDir, targetDir); err != nil {
+		os.RemoveAll(stagingDir)
+		return err
 	}
 
 	fmt.Fprintf(os.Stderr, "Model ready\n")
@@ -139,6 +234,11 @@ func downloadAndExtract(targetDir string) error {
 
 func extractTarBz2(archivePath, targetDir string) error {
 	if err := os.MkdirAll(targetDir, 0755); err != nil {
+		return err
+	}
+
+	baseDir, err := filepath.Abs(targetDir)
+	if err != nil {
 		return err
 	}
 
@@ -172,18 +272,29 @@ func extractTarBz2(archivePath, targetDir string) error {
 			continue
 		}
 
-		target := filepath.Join(targetDir, cleanName)
+		target := filepath.Join(baseDir, cleanName)
+		absTarget, err := filepath.Abs(target)
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(baseDir, absTarget)
+		if err != nil {
+			return err
+		}
+		if strings.HasPrefix(rel, "..") || filepath.IsAbs(rel) {
+			return fmt.Errorf("archive entry escapes target directory: %s", header.Name)
+		}
 
 		switch header.Typeflag {
 		case tar.TypeDir:
-			if err := os.MkdirAll(target, 0755); err != nil {
+			if err := os.MkdirAll(absTarget, 0755); err != nil {
 				return err
 			}
 		case tar.TypeReg:
-			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+			if err := os.MkdirAll(filepath.Dir(absTarget), 0755); err != nil {
 				return err
 			}
-			outFile, err := os.Create(target)
+			outFile, err := os.Create(absTarget)
 			if err != nil {
 				return err
 			}

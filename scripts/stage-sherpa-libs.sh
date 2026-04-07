@@ -10,7 +10,7 @@ linux_version="$(go list -m -f '{{.Version}}' github.com/k2-fsa/sherpa-onnx-go-l
 macos_version="$(go list -m -f '{{.Version}}' github.com/k2-fsa/sherpa-onnx-go-macos)"
 windows_version="$(go list -m -f '{{.Version}}' github.com/k2-fsa/sherpa-onnx-go-windows)"
 
-bundle_root="/tmp/chough-libbundle"
+bundle_root="/tmp/sittich-libbundle"
 
 mkdir -p "$bundle_root/linux_amd64"
 mkdir -p "$bundle_root/darwin_amd64"

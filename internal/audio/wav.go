@@ -2,19 +2,39 @@ package audio
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 )
+
+// ErrInvalidWAV is returned when a WAV file is malformed.
+var ErrInvalidWAV = errors.New("audio: invalid WAV file")
 
 // Wave represents audio data
 type Wave struct {
 	Samples    []float32
 	SampleRate int
+	Channels   int
 }
 
-// ReadWave reads a WAV file and returns the audio data
-// This is a pure Go implementation to avoid C memory leaks
+type wavHeader struct {
+	AudioFormat   uint16
+	NumChannels   uint16
+	SampleRate    uint32
+	ByteRate      uint32
+	BlockAlign    uint16
+	BitsPerSample uint16
+}
+
+const (
+	wavFormatPCM   = 1
+	wavFormatFloat = 3
+)
+
+// ReadWave reads a WAV file and returns the audio data.
+// It supports 8/16-bit PCM and 32-bit float formats.
 func ReadWave(filename string) (*Wave, error) {
 	file, err := os.Open(filename)
 	if err != nil {
@@ -22,102 +42,150 @@ func ReadWave(filename string) (*Wave, error) {
 	}
 	defer file.Close()
 
-	// Read RIFF header
-	var riffHeader [12]byte
-	if _, err := io.ReadFull(file, riffHeader[:]); err != nil {
-		return nil, fmt.Errorf("failed to read RIFF header: %w", err)
-	}
-
-	// Verify RIFF header
-	if string(riffHeader[0:4]) != "RIFF" {
-		return nil, fmt.Errorf("not a valid WAV file (no RIFF header), got: %s", string(riffHeader[0:4]))
-	}
-
-	// Verify WAVE format
-	if string(riffHeader[8:12]) != "WAVE" {
-		return nil, fmt.Errorf("not a valid WAV file (no WAVE format), got: %s", string(riffHeader[8:12]))
-	}
-
-	var (
-		sampleRate    int
-		numChannels   int
-		bitsPerSample int
-		dataSize      uint32
-	)
-
-	// Parse chunks
-	for {
-		// Read chunk header
-		var chunkHeader [8]byte
-		_, err := io.ReadFull(file, chunkHeader[:])
-		if err == io.EOF {
-			return nil, fmt.Errorf("no data chunk found in WAV file")
-		}
-		if err != nil {
-			return nil, fmt.Errorf("failed to read chunk header: %w", err)
-		}
-
-		chunkID := string(chunkHeader[0:4])
-		chunkSize := binary.LittleEndian.Uint32(chunkHeader[4:8])
-
-		switch chunkID {
-		case "fmt ":
-			// Read fmt chunk
-			fmtData := make([]byte, chunkSize)
-			if _, err := io.ReadFull(file, fmtData); err != nil {
-				return nil, fmt.Errorf("failed to read fmt chunk: %w", err)
-			}
-
-			// Parse fmt chunk
-			audioFormat := binary.LittleEndian.Uint16(fmtData[0:2])
-			if audioFormat != 1 {
-				return nil, fmt.Errorf("unsupported audio format: %d (only PCM supported)", audioFormat)
-			}
-
-			numChannels = int(binary.LittleEndian.Uint16(fmtData[2:4]))
-			sampleRate = int(binary.LittleEndian.Uint32(fmtData[4:8]))
-			// Skip byte rate (8-12) and block align (12-14)
-			bitsPerSample = int(binary.LittleEndian.Uint16(fmtData[14:16]))
-
-			if numChannels != 1 {
-				return nil, fmt.Errorf("unsupported number of channels: %d (only mono supported)", numChannels)
-			}
-			if bitsPerSample != 16 {
-				return nil, fmt.Errorf("unsupported bits per sample: %d (only 16-bit supported)", bitsPerSample)
-			}
-
-		case "data":
-			dataSize = chunkSize
-			// Read the audio data now
-			return readSamples(file, sampleRate, dataSize)
-
-		default:
-			// Skip unknown chunks (LIST, INFO, etc.)
-			if _, err := file.Seek(int64(chunkSize), 1); err != nil {
-				return nil, fmt.Errorf("failed to skip chunk %s: %w", chunkID, err)
-			}
-		}
-	}
+	return DecodeWAV(file)
 }
 
-func readSamples(file *os.File, sampleRate int, dataSize uint32) (*Wave, error) {
-	// Read all samples
-	data := make([]byte, dataSize)
-	if _, err := io.ReadFull(file, data); err != nil {
-		return nil, fmt.Errorf("failed to read audio data: %w", err)
+// DecodeWAV decodes WAV data from an io.Reader.
+func DecodeWAV(r io.Reader) (*Wave, error) {
+	var riffID [4]byte
+	if err := binary.Read(r, binary.LittleEndian, &riffID); err != nil {
+		return nil, fmt.Errorf("%w: read RIFF: %v", ErrInvalidWAV, err)
+	}
+	if string(riffID[:]) != "RIFF" {
+		return nil, fmt.Errorf("%w: missing RIFF", ErrInvalidWAV)
 	}
 
-	// Convert int16 samples to float32
-	numSamples := int(dataSize) / 2
+	var fileSize uint32
+	binary.Read(r, binary.LittleEndian, &fileSize) // Skip
+
+	var waveID [4]byte
+	binary.Read(r, binary.LittleEndian, &waveID)
+	if string(waveID[:]) != "WAVE" {
+		return nil, fmt.Errorf("%w: missing WAVE", ErrInvalidWAV)
+	}
+
+	var hdr wavHeader
+	var hdrFound bool
+
+	for {
+		var chunkID [4]byte
+		if err := binary.Read(r, binary.LittleEndian, &chunkID); err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return nil, err
+		}
+
+		var chunkSize uint32
+		if err := binary.Read(r, binary.LittleEndian, &chunkSize); err != nil {
+			return nil, err
+		}
+
+		id := string(chunkID[:])
+		switch id {
+		case "fmt ":
+			if err := parseFmtChunk(r, chunkSize, &hdr); err != nil {
+				return nil, err
+			}
+			hdrFound = true
+		case "data":
+			if !hdrFound {
+				return nil, fmt.Errorf("%w: data before fmt", ErrInvalidWAV)
+			}
+			samples, err := streamDataChunk(r, chunkSize, &hdr)
+			if err != nil {
+				return nil, err
+			}
+			return &Wave{
+				Samples:    samples,
+				SampleRate: int(hdr.SampleRate),
+				Channels:   int(hdr.NumChannels),
+			}, nil
+		default:
+			// Skip unknown chunks
+			if _, err := io.CopyN(io.Discard, r, int64(chunkSize)); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	return nil, fmt.Errorf("%w: no data", ErrInvalidWAV)
+}
+
+func parseFmtChunk(r io.Reader, size uint32, hdr *wavHeader) error {
+	if err := binary.Read(r, binary.LittleEndian, &hdr.AudioFormat); err != nil {
+		return err
+	}
+	if err := binary.Read(r, binary.LittleEndian, &hdr.NumChannels); err != nil {
+		return err
+	}
+	if err := binary.Read(r, binary.LittleEndian, &hdr.SampleRate); err != nil {
+		return err
+	}
+	if err := binary.Read(r, binary.LittleEndian, &hdr.ByteRate); err != nil {
+		return err
+	}
+	if err := binary.Read(r, binary.LittleEndian, &hdr.BlockAlign); err != nil {
+		return err
+	}
+	if err := binary.Read(r, binary.LittleEndian, &hdr.BitsPerSample); err != nil {
+		return err
+	}
+	if size > 16 {
+		if _, err := io.CopyN(io.Discard, r, int64(size-16)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func streamDataChunk(r io.Reader, size uint32, hdr *wavHeader) ([]float32, error) {
+	bytesPerSample := int(hdr.BitsPerSample) / 8
+	if bytesPerSample == 0 {
+		return nil, fmt.Errorf("%w: invalid bits per sample: %d", ErrInvalidWAV, hdr.BitsPerSample)
+	}
+	numSamples := int(size) / bytesPerSample
 	samples := make([]float32, numSamples)
 
-	for i := 0; i < numSamples; i++ {
-		sample := int16(binary.LittleEndian.Uint16(data[i*2 : (i+1)*2]))
-		samples[i] = float32(sample) / 32768.0
+	// Use a small buffer to read and convert in chunks
+	const bufSamples = 4096
+	buf := make([]byte, bufSamples*bytesPerSample)
+
+	for i := 0; i < numSamples; {
+		toRead := bufSamples
+		if i+toRead > numSamples {
+			toRead = numSamples - i
+		}
+
+		n, err := io.ReadFull(r, buf[:toRead*bytesPerSample])
+		if err != nil && !errors.Is(err, io.EOF) {
+			return nil, err
+		}
+		if n == 0 {
+			break
+		}
+
+		// Convert the buffer to float32
+		actualRead := n / bytesPerSample
+		for j := 0; j < actualRead; j++ {
+			off := j * bytesPerSample
+			idx := i + j
+
+			switch {
+			case hdr.AudioFormat == wavFormatPCM && hdr.BitsPerSample == 16:
+				v := int16(binary.LittleEndian.Uint16(buf[off : off+2]))
+				samples[idx] = float32(v) / 32768.0
+			case hdr.AudioFormat == wavFormatPCM && hdr.BitsPerSample == 8:
+				samples[idx] = (float32(buf[off]) - 128.0) / 128.0
+			case hdr.AudioFormat == wavFormatFloat && hdr.BitsPerSample == 32:
+				bits := binary.LittleEndian.Uint32(buf[off : off+4])
+				samples[idx] = math.Float32frombits(bits)
+			default:
+				// Skip unsupported formats for now
+			}
+		}
+		i += actualRead
 	}
 
-	return &Wave{
-		Samples:    samples,
-		SampleRate: sampleRate,
-	}, nil
+	return samples, nil
 }

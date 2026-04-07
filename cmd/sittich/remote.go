@@ -12,38 +12,38 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/hyperpuncher/chough/internal/types"
+	"github.com/negbie/sittich/internal/types"
 )
 
 type remoteJSONResponse struct {
-	Success  bool                `json:"success"`
-	Error    string              `json:"error,omitempty"`
-	Duration float64             `json:"duration_seconds"`
-	Text     string              `json:"text"`
-	Chunks   []types.ChunkResult `json:"chunks,omitempty"`
+	Success  bool            `json:"success"`
+	Error    string          `json:"error,omitempty"`
+	Duration float64         `json:"duration_seconds"`
+	Text     string          `json:"text"`
+	Segments []types.Segment `json:"segments,omitempty"`
 }
 
 func resolveRemoteURL() (string, error) {
-	raw := strings.TrimSpace(os.Getenv("CHOUGH_URL"))
+	raw := strings.TrimSpace(os.Getenv("sittich_URL"))
 	if raw == "" {
-		return "", fmt.Errorf("--remote requires CHOUGH_URL (e.g. CHOUGH_URL=http://localhost:8080)")
+		return "", fmt.Errorf("--remote requires sittich_URL (e.g. sittich_URL=http://localhost:8080)")
 	}
 
 	u, err := url.Parse(raw)
 	if err != nil {
-		return "", fmt.Errorf("invalid CHOUGH_URL: %w", err)
+		return "", fmt.Errorf("invalid sittich_URL: %w", err)
 	}
 	if u.Scheme != "http" && u.Scheme != "https" {
-		return "", fmt.Errorf("invalid CHOUGH_URL %q: must start with http:// or https://", raw)
+		return "", fmt.Errorf("invalid sittich_URL %q: must start with http:// or https://", raw)
 	}
 	if u.Host == "" {
-		return "", fmt.Errorf("invalid CHOUGH_URL %q: missing host", raw)
+		return "", fmt.Errorf("invalid sittich_URL %q: missing host", raw)
 	}
 
 	return strings.TrimRight(raw, "/"), nil
 }
 
-func transcribeRemote(serverURL, audioFile string, chunkSize int) ([]types.ChunkResult, float64, error) {
+func transcribeRemote(serverURL, audioFile string, chunkSize int) ([]types.Segment, float64, error) {
 	body := &bytes.Buffer{}
 	writer := multipart.NewWriter(body)
 
@@ -104,13 +104,13 @@ func transcribeRemote(serverURL, audioFile string, chunkSize int) ([]types.Chunk
 		return nil, 0, fmt.Errorf("remote transcription failed")
 	}
 
-	if len(parsed.Chunks) > 0 {
-		return parsed.Chunks, parsed.Duration, nil
+	if len(parsed.Segments) > 0 {
+		return parsed.Segments, parsed.Duration, nil
 	}
 
 	if strings.TrimSpace(parsed.Text) == "" {
-		return []types.ChunkResult{}, parsed.Duration, nil
+		return []types.Segment{}, parsed.Duration, nil
 	}
 
-	return []types.ChunkResult{{Text: parsed.Text}}, parsed.Duration, nil
+	return []types.Segment{{Text: parsed.Text}}, parsed.Duration, nil
 }

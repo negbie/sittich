@@ -15,7 +15,7 @@ if [[ "$os_name" != "darwin" ]]; then
 	exit 0
 fi
 
-libs_dir="/tmp/chough-libbundle/${os_name}_${arch}"
+libs_dir="/tmp/sittich-libbundle/${os_name}_${arch}"
 if [[ ! -d "$libs_dir" ]]; then
 	echo "missing libs dir: $libs_dir" >&2
 	exit 1

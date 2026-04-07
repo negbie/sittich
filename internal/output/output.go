@@ -3,17 +3,17 @@ package output
 import (
 	"io"
 
-	"github.com/hyperpuncher/chough/internal/types"
+	"github.com/negbie/sittich/internal/types"
 )
 
-// Write writes formatted output to the given writer
-func Write(out io.Writer, format string, results []types.ChunkResult, duration float64) error {
+// Write writes formatted output to the given writer.
+func Write(out io.Writer, format string, result *types.Result) error {
 	switch format {
 	case "json":
-		return WriteJSON(out, results, duration)
+		return WriteJSON(out, result)
 	case "vtt":
-		return WriteVTT(out, results)
+		return WriteVTT(out, result)
 	default:
-		return WriteText(out, results)
+		return WriteText(out, result)
 	}
 }

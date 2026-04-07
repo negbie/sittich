@@ -4,23 +4,25 @@ import (
 	"encoding/json"
 	"io"
 
-	"github.com/hyperpuncher/chough/internal/types"
+	"github.com/negbie/sittich/internal/types"
 )
 
-// WriteJSON writes JSON output
-func WriteJSON(out io.Writer, results []types.ChunkResult, duration float64) error {
-	type Output struct {
-		Duration  float64             `json:"duration_seconds"`
-		Chunks    int                 `json:"chunks"`
-		Text      string              `json:"text"`
-		ChunkData []types.ChunkResult `json:"chunk_data,omitempty"`
-	}
+type JSONOutput struct {
+	Version  string          `json:"version"`
+	Duration float64         `json:"duration"`
+	Language string          `json:"language,omitempty"`
+	Text     string          `json:"text"`
+	Segments []types.Segment `json:"segments"`
+}
 
-	data := Output{
-		Duration:  duration,
-		Chunks:    len(results),
-		Text:      FullText(results),
-		ChunkData: results,
+// WriteJSON writes the transcription result in JSON format
+func WriteJSON(out io.Writer, result *types.Result) error {
+	data := JSONOutput{
+		Version:  "1.0",
+		Duration: result.Duration,
+		Language: result.Language,
+		Text:     result.FullText(),
+		Segments: result.Segments,
 	}
 
 	enc := json.NewEncoder(out)
