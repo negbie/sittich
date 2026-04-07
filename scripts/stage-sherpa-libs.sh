@@ -10,22 +10,41 @@ linux_version="$(go list -m -f '{{.Version}}' github.com/k2-fsa/sherpa-onnx-go-l
 macos_version="$(go list -m -f '{{.Version}}' github.com/k2-fsa/sherpa-onnx-go-macos)"
 windows_version="$(go list -m -f '{{.Version}}' github.com/k2-fsa/sherpa-onnx-go-windows)"
 
-bundle_root="/tmp/sittich-libbundle"
+bundle_root="${1:-/tmp/sittich-libbundle}"
+host_only="${SITTICH_HOST_ONLY:-0}"
+go_os="$(go env GOOS)"
+go_arch="$(go env GOARCH)"
 
-mkdir -p "$bundle_root/linux_amd64"
-mkdir -p "$bundle_root/darwin_amd64"
-mkdir -p "$bundle_root/darwin_arm64"
-mkdir -p "$bundle_root/windows_amd64"
+copy_libs() {
+	local platform="$1"
+	local arch="$2"
+	local pkg="$3"
+	local lib_src="$4"
 
-chmod -R u+w "$bundle_root" 2>/dev/null || true
+	if [[ "$host_only" == "1" ]]; then
+		if [[ "$platform" != "$go_os" ]] || [[ "$arch" != "$go_arch" ]]; then
+			return
+		fi
+	fi
 
-cp -f "${mod_cache}/github.com/k2-fsa/sherpa-onnx-go-linux@${linux_version}/lib/x86_64-unknown-linux-gnu"/*.so "$bundle_root/linux_amd64/"
-cp -f "${mod_cache}/github.com/k2-fsa/sherpa-onnx-go-macos@${macos_version}/lib/x86_64-apple-darwin"/*.dylib "$bundle_root/darwin_amd64/"
-cp -f "${mod_cache}/github.com/k2-fsa/sherpa-onnx-go-macos@${macos_version}/lib/aarch64-apple-darwin"/*.dylib "$bundle_root/darwin_arm64/"
+	local target_dir="$bundle_root/${platform}_${arch}"
+	mkdir -p "$target_dir"
+	
+	local version
+	version="$(go list -m -f '{{.Version}}' "github.com/k2-fsa/$pkg")"
+	local src_dir="${mod_cache}/github.com/k2-fsa/${pkg}@${version}/lib/${lib_src}"
+	
+	if [[ "$platform" == "windows" ]]; then
+		cp -f "$src_dir"/*.dll "$target_dir/"
+	elif [[ "$platform" == "darwin" ]]; then
+		cp -f "$src_dir"/*.dylib "$target_dir/"
+	else
+		cp -f "$src_dir"/*.so "$target_dir/"
+	fi
+}
 
-cp -f "${mod_cache}/github.com/k2-fsa/sherpa-onnx-go-windows@${windows_version}/lib/x86_64-pc-windows-gnu/sherpa-onnx-c-api.dll" "$bundle_root/windows_amd64/"
-cp -f "${mod_cache}/github.com/k2-fsa/sherpa-onnx-go-windows@${windows_version}/lib/x86_64-pc-windows-gnu/onnxruntime.dll" "$bundle_root/windows_amd64/"
-cp -f "${mod_cache}/github.com/k2-fsa/sherpa-onnx-go-windows@${windows_version}/lib/x86_64-pc-windows-gnu/sherpa-onnx-cxx-api.dll" "$bundle_root/windows_amd64/"
+copy_libs "linux" "amd64" "sherpa-onnx-go-linux" "x86_64-unknown-linux-gnu"
+copy_libs "darwin" "amd64" "sherpa-onnx-go-macos" "x86_64-apple-darwin"
+copy_libs "darwin" "arm64" "sherpa-onnx-go-macos" "aarch64-apple-darwin"
+copy_libs "windows" "amd64" "sherpa-onnx-go-windows" "x86_64-pc-windows-gnu"
 
-mkdir -p .tmp-libbundle
-ln -sfn "$bundle_root" .tmp-libbundle/current

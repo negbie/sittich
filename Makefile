@@ -19,31 +19,40 @@ else
 	LIB_PLATFORM := linux_$(GO_ARCH)
 endif
 
-.PHONY: all build build-local stage-libs bundle run clean help
+# Go build flags for size optimization (strip symbols and debug info)
+GO_LDFLAGS := -s -w -X main.version=$(VERSION)
 
-all: bundle
+.PHONY: all build build-local stage-libs stage-libs-embedded bundle build-embedded release run clean help
+
+all: build-embedded
 
 help:
 	@echo "sittich build system"
 	@echo ""
 	@echo "Targets:"
-	@echo "  build         Build the binary to $(BIN_DIR)/"
-	@echo "  stage-libs    Extract shared libraries from Go mod cache"
-	@echo "  bundle        Build binary, copy libs, and patch runtime paths (Linux/macOS)"
-	@echo "  run           Build and run locally with LD_LIBRARY_PATH"
-	@echo "  clean         Remove build artifacts"
+	@echo "  build          Build the binary to $(BIN_DIR)/"
+	@echo "  stage-libs     Extract shared libraries from Go mod cache"
+	@echo "  bundle         Build binary, copy libs, and patch runtime paths (Linux/macOS)"
+	@echo "  build-embedded Build portable binary with embedded host-only libs"
+	@echo "  release        Build, strip, and compress with UPX"
+	@echo "  run            Build and run locally with LD_LIBRARY_PATH"
+	@echo "  clean          Remove build artifacts"
 	@echo ""
 
 # Build the Go binary
 build:
 	@echo "Building $(BINARY_NAME) $(VERSION)..."
 	@mkdir -p $(BIN_DIR)
-	go build -o $(BIN_DIR)/$(BINARY_NAME) ./cmd/sittich
+	go build -ldflags="$(GO_LDFLAGS)" -o $(BIN_DIR)/$(BINARY_NAME) ./cmd/sittich
 
 # Step 1: Stage libraries from Go mod cache to /tmp/sittich-libbundle
 stage-libs:
-	@echo "Staging sherpa-onnx shared libraries..."
-	@bash ./scripts/stage-sherpa-libs.sh
+	@echo "Staging sherpa-onnx shared libraries to /tmp..."
+	@bash ./scripts/stage-sherpa-libs.sh /tmp/sittich-libbundle
+
+# Stage libraries for embedding into the binary (Host platform only)
+stage-libs-embedded:
+	@SITTICH_HOST_ONLY=1 bash ./scripts/stage-sherpa-libs.sh internal/libbundle/libs
 
 # Step 2: Full bundle (build + libs + rpath fix)
 bundle: build stage-libs
@@ -52,6 +61,22 @@ bundle: build stage-libs
 	@echo "Patching runtime paths..."
 	@bash ./scripts/fix-runtime-paths.sh $(BIN_DIR)/$(BINARY_NAME) $(GO_OS) $(GO_ARCH)
 	@echo "Bundle ready in $(BIN_DIR)/"
+	@ls -sh $(BIN_DIR)/
+
+# Single portable binary with embedded libs (Host platform only)
+build-embedded: stage-libs-embedded build
+	@echo "Portable binary ready in $(BIN_DIR)/"
+	@ls -sh $(BIN_DIR)/
+
+# Final release optimization (Strip + UPX)
+release: build-embedded
+	@if command -v upx > /dev/null; then \
+		echo "Compressing with UPX..."; \
+		upx $(BIN_DIR)/$(BINARY_NAME); \
+	else \
+		echo "UPX not found, skipping compression."; \
+	fi
+	@echo "Release binary ready in $(BIN_DIR)/"
 	@ls -sh $(BIN_DIR)/
 
 # Local build Alias
