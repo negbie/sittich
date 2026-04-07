@@ -195,11 +195,6 @@ func calibrateAudio(audio []float32) []float32 {
 		return audio
 	}
 
-	// 1. Acoustic Floor & Intensity Scaling
-	// Target Intensity: Peak at ~5.4 log-units.
-	// We scale the waveform so that the maximum log-magnitude (after feature extraction)
-	// would reach this level. As a proxy for the waveform, we scale such that
-	// max(abs(samples)) is near 1.0, but we also apply a slight boost if needed.
 	maxVal := float32(0)
 	for _, v := range audio {
 		absV := float32(0)
@@ -217,10 +212,7 @@ func calibrateAudio(audio []float32) []float32 {
 		return audio // Too quiet, avoid boosting noise
 	}
 
-	// Calculate scale to peak around 1.0 (standard normalization)
-	// Then apply a boost factor consistent with 5.4 log-units calibration.
-	// 5.4 log-units is quite high, often implying the signal shouldn't be too attenuated.
-	scale := 1.0 / maxVal
+	scale := 200.0 / maxVal
 	calibrated := make([]float32, len(audio))
 
 	const floor = 1e-20

@@ -30,7 +30,7 @@ const (
 	defaultChunkSize      = 60
 	defaultFormat         = "text"
 	defaultMaxActivePaths = 2
-	defaultDecodingMethod = "modified_beam_search"
+	defaultDecodingMethod = "greedy_search"
 	defaultWorkers        = 2
 	defaultMaxUploadMB    = 1024
 )
@@ -45,12 +45,12 @@ type cliOptions struct {
 	MaxActivePaths int
 	DecodingMethod string
 
-	DataFolder     string
-	RemoteURL      string
-	ListenAddr     string
-	Workers        int
-	MaxUploadMB    int
-	Debug          bool
+	DataFolder  string
+	RemoteURL   string
+	ListenAddr  string
+	Workers     int
+	MaxUploadMB int
+	Debug       bool
 }
 
 type cliFlag struct {
