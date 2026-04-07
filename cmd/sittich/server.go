@@ -19,9 +19,11 @@ func runServer(opts *cliOptions) error {
 	defer showCursor()
 
 	fmt.Fprint(os.Stderr, "Loading model...\r")
-	cfg := asr.DefaultConfig("")
-	cfg.DecodingMethod = opts.DecodingMethod
-	cfg.MaxActivePaths = opts.MaxActivePaths
+	cfg := &asr.Config{
+		ModelPath:      opts.DataFolder,
+		DecodingMethod: opts.DecodingMethod,
+		MaxActivePaths: opts.MaxActivePaths,
+	}
 
 	recognizer, err := server.LoadRecognizer(cfg)
 	if err != nil {
@@ -33,14 +35,13 @@ func runServer(opts *cliOptions) error {
 
 	// Create worker pool
 	serverOpts := &server.ServerOptions{
-		Host:         opts.ServerHost,
-		Port:         opts.ServerPort,
+		ListenAddr:   opts.ListenAddr,
 		MaxUploadMB:  int64(opts.MaxUploadMB),
 		Workers:      opts.Workers,
 		MaxQueueSize: 10,
 		Debug:        opts.Debug,
 	}
-	pool := worker.NewPool(opts.Workers, 10, recognizer, opts.Debug, opts.VADEnabled)
+	pool := worker.NewPool(opts.Workers, 10, recognizer, opts.Debug, opts.DataFolder)
 	defer pool.Shutdown()
 
 	// Create HTTP server
@@ -48,11 +49,11 @@ func runServer(opts *cliOptions) error {
 	srv.SetDefaults(opts.Format, opts.ChunkSize)
 
 	// Start server
-	fmt.Fprintf(os.Stderr, "   Server running on http://%s:%d\n", opts.ServerHost, opts.ServerPort)
+	fmt.Fprintf(os.Stderr, "   Server running on http://%s\n", opts.ListenAddr)
 	fmt.Fprintf(os.Stderr, "   POST /transcribe - Transcribe audio\n")
 	fmt.Fprintf(os.Stderr, "   GET  /health     - Health check\n")
-	fmt.Fprintf(os.Stderr, "   defaults: format=%s chunk-size=%ds vad=%v decoding=%s max-active-paths=%d\n",
-		opts.Format, opts.ChunkSize, opts.VADEnabled, opts.DecodingMethod, opts.MaxActivePaths)
+	fmt.Fprintf(os.Stderr, "   defaults: format=%s chunk-size=%ds decoding=%s max-active-paths=%d\n",
+		opts.Format, opts.ChunkSize, opts.DecodingMethod, opts.MaxActivePaths)
 	fmt.Fprintf(os.Stderr, "\nPress Ctrl+C to stop\n")
 
 	// Handle shutdown

@@ -47,7 +47,7 @@ func NewServer(options *ServerOptions, pool RecognizerPool, version string) *Ser
 	mux.HandleFunc("/health", s.handleHealth)
 
 	s.httpServer = &http.Server{
-		Addr:    fmt.Sprintf("%s:%d", options.Host, options.Port),
+		Addr:    options.ListenAddr,
 		Handler: s.withMiddleware(mux),
 	}
 
@@ -376,13 +376,15 @@ func (s *Server) sendFormattedResponse(w http.ResponseWriter, format string, jr 
 }
 
 func LoadRecognizer(cfg *asr.Config) (*asr.Recognizer, error) {
-	modelPath, err := models.GetModelPath()
+	modelPath, err := models.GetModelPath(cfg.ModelPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get model: %w", err)
 	}
 
 	if cfg == nil {
-		cfg = asr.DefaultConfig(modelPath)
+		cfg = &asr.Config{
+			ModelPath: modelPath,
+		}
 	} else {
 		cfg.ModelPath = modelPath
 	}

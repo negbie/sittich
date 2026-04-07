@@ -35,7 +35,7 @@ func run(args []string) error {
 	}
 
 	// Server mode
-	if opts.ServerMode {
+	if opts.ListenAddr != "" {
 		return runServer(&opts)
 	}
 
@@ -54,8 +54,8 @@ func run(args []string) error {
 	var results []types.Segment
 	var duration float64
 
-	if opts.RemoteMode {
-		serverURL, err := resolveRemoteURL()
+	if opts.RemoteURL != "" {
+		serverURL, err := validateRemoteURL(opts.RemoteURL)
 		if err != nil {
 			return err
 		}
@@ -80,17 +80,14 @@ func run(args []string) error {
 		}
 		defer recognizer.Close()
 
-		vadPath := ""
-		if opts.VADEnabled {
-			vadPath, err = models.GetVADPath()
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: failed to get VAD model: %v. Proceeding without VAD.\n", err)
-			}
+		vadPath, err := models.GetVADPath(opts.DataFolder)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to get VAD model: %v. Proceeding without VAD.\n", err)
 		}
 
 		// 2. Setup Pipeline
 		pipe, err := pipeline.NewPipeline(recognizer, pipeline.PipelineConfig{
-			VADEnabled:    opts.VADEnabled && vadPath != "",
+			VADEnabled:    vadPath != "",
 			VADModelPath:  vadPath,
 			ChunkDuration: float64(opts.ChunkSize),
 			Debug:         opts.Debug,
@@ -151,15 +148,17 @@ func loadRecognizer(opts cliOptions) (*asr.Recognizer, error) {
 	defer showCursor()
 
 	fmt.Fprint(os.Stderr, "Loading ASR model...\r")
-	modelPath, err := models.GetModelPath()
+	modelPath, err := models.GetModelPath(opts.DataFolder)
 	if err != nil {
 		fmt.Fprintln(os.Stderr)
 		return nil, fmt.Errorf("failed to get model: %w", err)
 	}
 
-	cfg := asr.DefaultConfig(modelPath)
-	cfg.DecodingMethod = opts.DecodingMethod
-	cfg.MaxActivePaths = opts.MaxActivePaths
+	cfg := &asr.Config{
+		ModelPath:      modelPath,
+		DecodingMethod: opts.DecodingMethod,
+		MaxActivePaths: opts.MaxActivePaths,
+	}
 
 	recognizer, err := asr.NewRecognizer(cfg)
 	if err != nil {

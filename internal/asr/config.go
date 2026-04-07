@@ -10,15 +10,3 @@ type Config struct {
 	DecodingMethod string
 	MaxActivePaths int
 }
-
-func DefaultConfig(modelPath string) *Config {
-	return &Config{
-		ModelPath:      "./data",
-		NumThreads:     4,
-		SampleRate:     16000,
-		FeatureDim:     80,
-		Provider:       "cpu",
-		DecodingMethod: "modified_beam_search",
-		MaxActivePaths: 2,
-	}
-}

@@ -23,21 +23,21 @@ type remoteJSONResponse struct {
 	Segments []types.Segment `json:"segments,omitempty"`
 }
 
-func resolveRemoteURL() (string, error) {
-	raw := strings.TrimSpace(os.Getenv("sittich_URL"))
+func validateRemoteURL(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
 	if raw == "" {
-		return "", fmt.Errorf("--remote requires sittich_URL (e.g. sittich_URL=http://localhost:8080)")
+		return "", fmt.Errorf("--remote requires --url (e.g. --url http://localhost:8080)")
 	}
 
 	u, err := url.Parse(raw)
 	if err != nil {
-		return "", fmt.Errorf("invalid sittich_URL: %w", err)
+		return "", fmt.Errorf("invalid URL: %w", err)
 	}
 	if u.Scheme != "http" && u.Scheme != "https" {
-		return "", fmt.Errorf("invalid sittich_URL %q: must start with http:// or https://", raw)
+		return "", fmt.Errorf("invalid URL %q: must start with http:// or https://", raw)
 	}
 	if u.Host == "" {
-		return "", fmt.Errorf("invalid sittich_URL %q: missing host", raw)
+		return "", fmt.Errorf("invalid URL %q: missing host", raw)
 	}
 
 	return strings.TrimRight(raw, "/"), nil

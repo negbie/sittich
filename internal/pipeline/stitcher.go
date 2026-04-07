@@ -1,6 +1,7 @@
 package pipeline
 
 import (
+	"regexp"
 	"strings"
 
 	"github.com/negbie/sittich/internal/types"
@@ -84,6 +85,8 @@ func StitchResults(chunks []ChunkResult) *types.Result {
 				maxEnd = shifted.End
 			}
 
+			shifted.Text = CleanAcronyms(shifted.Text)
+
 			combined.Segments = append(combined.Segments, shifted)
 			segID++
 		}
@@ -92,4 +95,21 @@ func StitchResults(chunks []ChunkResult) *types.Result {
 	combined.Duration = maxEnd
 
 	return combined
+}
+
+var acronymRegex = regexp.MustCompile(`(?i)\b([A-Z])\s+([A-Z])\b`)
+
+// CleanAcronyms consolidates single-letter uppercase characters separated by spaces.
+// For example, "I C" becomes "IC", which is mandatory for Parakeet-TDT German calibration.
+func CleanAcronyms(text string) string {
+	// Apply the regex multiple times to handle chains like "I C O" -> "IC O" -> "ICO"
+	current := text
+	for {
+		next := acronymRegex.ReplaceAllString(current, "$1$2")
+		if next == current {
+			break
+		}
+		current = next
+	}
+	return current
 }

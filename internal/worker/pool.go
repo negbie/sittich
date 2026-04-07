@@ -32,20 +32,18 @@ type Pool struct {
 }
 
 // NewPool creates a new worker pool
-func NewPool(workers int, queueSize int, recognizer *asr.Recognizer, debug bool, vadEnabled bool) *Pool {
+func NewPool(workers int, queueSize int, recognizer *asr.Recognizer, debug bool, dataDir string) *Pool {
 	ctx, cancel := context.WithCancel(context.Background())
 
-	vadPath := ""
-	if vadEnabled {
-		vadPath, _ = models.GetVADPath()
-	}
+	// Always enable VAD
+	vadPath, _ := models.GetVADPath(dataDir)
 
 	p := &Pool{
 		workers:      workers,
 		queue:        make(chan *server.Job, queueSize),
 		recognizer:   recognizer,
 		vadModelPath: vadPath,
-		vadEnabled:   vadEnabled,
+		vadEnabled:   true,
 		ctx:          ctx,
 		cancel:       cancel,
 		debug:        debug,

@@ -26,6 +26,16 @@ var (
 	errInvalidArgs = errors.New("invalid arguments")
 )
 
+const (
+	defaultChunkSize      = 60
+	defaultFormat         = "text"
+	defaultMaxActivePaths = 2
+	defaultDecodingMethod = "modified_beam_search"
+	defaultWorkers        = 2
+	defaultMaxUploadMB    = 1024
+	defaultParallelChunks = 1
+)
+
 type cliOptions struct {
 	// CLI mode
 	AudioFile      string
@@ -33,19 +43,16 @@ type cliOptions struct {
 	Format         string
 	OutputFile     string
 	ShowVersion    bool
-	RemoteMode     bool
 	MaxActivePaths int
 	DecodingMethod string
-	VADEnabled     bool
 
-	// Server mode
-	ServerMode     bool
-	ServerHost     string
-	ServerPort     int
+	ParallelChunks int
+	DataFolder     string
+	RemoteURL      string
+	ListenAddr     string
 	Workers        int
 	MaxUploadMB    int
 	Debug          bool
-	ParallelChunks int
 }
 
 type cliFlag struct {
@@ -63,25 +70,23 @@ type usageRow struct {
 }
 
 var allFlags = []cliFlag{
-	{short: "c", long: "chunk-size", arg: "int", description: "chunk size in seconds", defaultVal: "60"},
-	{short: "f", long: "format", arg: "string", description: "output format: text, json, vtt", defaultVal: "text"},
-	{short: "o", long: "output", arg: "file", description: "output file", defaultVal: "stdout"},
-	{short: "r", long: "remote", description: "transcribe via remote server using sittich_URL"},
-	{long: "server", description: "run in server mode"},
-	{long: "host", arg: "string", description: "server host", defaultVal: "0.0.0.0"},
-	{long: "port", arg: "int", description: "server port", defaultVal: "8080"},
+	{long: "chunk-size", arg: "int", description: "chunk size in seconds", defaultVal: "60"},
+	{long: "format", arg: "string", description: "output format: text, json, vtt", defaultVal: defaultFormat},
+	{long: "output", arg: "file", description: "output file", defaultVal: "stdout"},
+	{long: "remote-url", arg: "string", description: "transcribe via remote server"},
+	{long: "listen", arg: "address", description: "listen address"},
 	{long: "workers", arg: "int", description: "concurrent workers", defaultVal: "2"},
 	{long: "max-upload", arg: "int", description: "max upload size in MB", defaultVal: "1024"},
-	{short: "d", long: "debug", description: "show detailed debug logs"},
-	{long: "vad", description: "enable voice activity detection", defaultVal: "true"},
-	{long: "max-active-paths", arg: "int", description: "number of active paths for modified beam search", defaultVal: "2"},
-	{long: "decoding-method", arg: "string", description: "decoding method: greedy_search or modified_beam_search", defaultVal: "modified_beam_search"},
+	{long: "debug", description: "show detailed debug logs"},
+	{long: "max-active-paths", arg: "int", description: "number of active paths for modified beam search", defaultVal: "4"},
+	{long: "decoding-method", arg: "string", description: "decoding method: greedy_search or modified_beam_search", defaultVal: defaultDecodingMethod},
+	{long: "data-folder", arg: "path", description: "path to model directory"},
 	{long: "parallel-chunks", arg: "int", description: "number of chunks to process in parallel", defaultVal: "1"},
 	{long: "version", description: "show version"},
 }
 
 func init() {
-	if !isStderrTTY() || os.Getenv("NO_COLOR") != "" {
+	if !isStderrTTY() {
 		disableColors()
 	}
 }
@@ -110,28 +115,21 @@ func parseCLI(args []string) (cliOptions, error) {
 	fs.SetOutput(io.Discard)
 
 	// CLI flags
-	chunkSize := fs.Int("c", 60, "chunk size in seconds")
-	fs.IntVar(chunkSize, "chunk-size", 60, "chunk size in seconds")
-	format := fs.String("f", "text", "output format (text, json, vtt)")
-	fs.StringVar(format, "format", "text", "output format (text, json, vtt)")
-	outputFile := fs.String("o", "", "output file")
-	fs.StringVar(outputFile, "output", "", "output file")
+	chunkSize := fs.Int("chunk-size", defaultChunkSize, "chunk size in seconds")
+	format := fs.String("format", defaultFormat, "output format (text, json, vtt)")
+	outputFile := fs.String("output", "", "output file")
 	showVersion := fs.Bool("version", false, "show version")
-	remoteMode := fs.Bool("r", false, "transcribe via remote server using sittich_URL")
-	fs.BoolVar(remoteMode, "remote", false, "transcribe via remote server using sittich_URL")
-	vadEnabled := fs.Bool("vad", true, "enable voice activity detection")
-	maxActivePaths := fs.Int("max-active-paths", 2, "number of active paths for modified beam search")
-	decodingMethod := fs.String("decoding-method", "modified_beam_search", "decoding method: greedy_search or modified_beam_search")
+	remoteURL := fs.String("remote-url", "", "transcribe via remote server")
+	maxActivePaths := fs.Int("max-active-paths", defaultMaxActivePaths, "number of active paths for modified beam search")
+	decodingMethod := fs.String("decoding-method", defaultDecodingMethod, "decoding method: greedy_search or modified_beam_search")
 
 	// Server flags
-	serverMode := fs.Bool("server", false, "run in server mode")
-	serverHost := fs.String("host", "0.0.0.0", "server host")
-	serverPort := fs.Int("port", 8080, "server port")
-	workers := fs.Int("workers", 2, "concurrent workers")
-	maxUploadMB := fs.Int("max-upload", 1024, "max upload size in MB")
-	debug := fs.Bool("d", false, "show detailed debug logs")
-	fs.BoolVar(debug, "debug", false, "show detailed debug logs")
-	parallelChunks := fs.Int("parallel-chunks", 1, "number of chunks to process in parallel")
+	listenAddr := fs.String("listen", "", "listen address")
+	workers := fs.Int("workers", defaultWorkers, "concurrent workers")
+	maxUploadMB := fs.Int("max-upload", defaultMaxUploadMB, "max upload size in MB")
+	debug := fs.Bool("debug", false, "show detailed debug logs")
+	parallelChunks := fs.Int("parallel-chunks", defaultParallelChunks, "number of chunks to process in parallel")
+	dataFolder := fs.String("data-folder", "", "path to model directory")
 
 	fs.Usage = func() {
 		printUsage()
@@ -149,20 +147,18 @@ func parseCLI(args []string) (cliOptions, error) {
 		Format:         strings.ToLower(*format),
 		OutputFile:     *outputFile,
 		ShowVersion:    *showVersion,
-		RemoteMode:     *remoteMode,
-		VADEnabled:     *vadEnabled,
 		MaxActivePaths: *maxActivePaths,
 		DecodingMethod: strings.ToLower(*decodingMethod),
-		ServerMode:     *serverMode,
-		ServerHost:     *serverHost,
-		ServerPort:     *serverPort,
 		Workers:        *workers,
 		MaxUploadMB:    *maxUploadMB,
 		Debug:          *debug,
 		ParallelChunks: *parallelChunks,
+		DataFolder:     *dataFolder,
+		RemoteURL:      *remoteURL,
+		ListenAddr:     *listenAddr,
 	}
 
-	if opts.ShowVersion || opts.ServerMode {
+	if opts.ShowVersion || opts.ListenAddr != "" {
 		return opts, nil
 	}
 
@@ -267,18 +263,11 @@ func printUsage() {
 	exampleRows := []usageRow{
 		{label: fmt.Sprintf("%s$%s sittich audio.wav", green, reset), plainLabel: "$ sittich audio.wav", desc: fmt.Sprintf("%s# 60s chunks, text output%s", dim, reset)},
 		{label: fmt.Sprintf("%s$%s cat audio.wav | sittich", green, reset), plainLabel: "$ cat audio.wav | sittich", desc: fmt.Sprintf("%s# transcribe from pipe%s", dim, reset)},
-		{label: fmt.Sprintf("%s$%s sittich -c 30 talk.wav", green, reset), plainLabel: "$ sittich -c 30 talk.wav", desc: fmt.Sprintf("%s# 30s chunks%s", dim, reset)},
-		{label: fmt.Sprintf("%s$%s sittich_URL=http://localhost:8080 sittich -r audio.wav", green, reset), plainLabel: "$ sittich_URL=http://localhost:8080 sittich -r audio.wav", desc: fmt.Sprintf("%s# transcribe via remote server%s", dim, reset)},
-		{label: fmt.Sprintf("%s$%s sittich -f vtt -o subs.vtt audio.wav", green, reset), plainLabel: "$ sittich -f vtt -o subs.vtt audio.wav", desc: fmt.Sprintf("%s# WebVTT to file%s", dim, reset)},
-		{label: fmt.Sprintf("%s$%s sittich --server --port 8080", green, reset), plainLabel: "$ sittich --server --port 8080", desc: fmt.Sprintf("%s# Run server on port 8080%s", dim, reset)},
+		{label: fmt.Sprintf("%s$%s sittich --chunk-size 30 talk.wav", green, reset), plainLabel: "$ sittich --chunk-size 30 talk.wav", desc: fmt.Sprintf("%s# 30s chunks%s", dim, reset)},
+		{label: fmt.Sprintf("%s$%s sittich --remote-url http://localhost:8080 audio.wav", green, reset), plainLabel: "$ sittich --remote-url http://localhost:8080 audio.wav", desc: fmt.Sprintf("%s# transcribe via remote server%s", dim, reset)},
+		{label: fmt.Sprintf("%s$%s sittich --format vtt --output subs.vtt audio.wav", green, reset), plainLabel: "$ sittich --format vtt --output subs.vtt audio.wav", desc: fmt.Sprintf("%s# WebVTT to file%s", dim, reset)},
+		{label: fmt.Sprintf("%s$%s sittich --listen :8080", green, reset), plainLabel: "$ sittich --listen :8080", desc: fmt.Sprintf("%s# Run server on port 8080%s", dim, reset)},
 	}
 	printAlignedRows(exampleRows)
 	fmt.Fprintln(os.Stderr)
-
-	fmt.Fprintf(os.Stderr, "%sEnvironment:%s\n", bold, reset)
-	envRows := []usageRow{
-		{label: fmt.Sprintf("%ssittich_MODEL%s", cyan, reset), plainLabel: "sittich_MODEL", desc: fmt.Sprintf("path to model dir %s(optional, auto-downloaded if not set)%s", dim, reset)},
-		{label: fmt.Sprintf("%ssittich_URL%s", cyan, reset), plainLabel: "sittich_URL", desc: fmt.Sprintf("remote server URL %s(required with --remote, must start with http:// or https://)%s", dim, reset)},
-	}
-	printAlignedRows(envRows)
 }

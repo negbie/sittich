@@ -27,10 +27,14 @@ const (
 
 var requiredModelFiles = []string{EncoderFile, DecoderFile, JoinerFile, TokensFile}
 
-// GetVADPath returns the path to the VAD model file, downloading if necessary
-func GetVADPath() (string, error) {
-	cacheDir := getCacheDir()
-	vadDir := filepath.Join(cacheDir, "sittich", "models", VADModelName)
+// GetVADPath returns the path to the VAD model file, downloading if necessary.
+// If dataDir is empty, it defaults to "./data".
+func GetVADPath(dataDir string) (string, error) {
+	if dataDir == "" {
+		dataDir = "./data"
+	}
+
+	vadDir := filepath.Join(dataDir, VADModelName)
 	vadPath := filepath.Join(vadDir, VADFile)
 
 	if _, err := os.Stat(vadPath); err == nil {
@@ -86,48 +90,25 @@ func downloadFile(url, path string) error {
 	return nil
 }
 
-// GetModelPath returns the path to the model directory, downloading if necessary
-func GetModelPath() (string, error) {
-	// 1. Prefer local ./data directory
-	localModelDir := "./data"
-	if isValidModel(localModelDir) {
-		return localModelDir, nil
+// GetModelPath returns the path to the model directory, downloading if necessary.
+// If dataDir is empty, it defaults to "./data".
+func GetModelPath(dataDir string) (string, error) {
+	if dataDir == "" {
+		dataDir = "./data"
 	}
 
-	// 2. Check sittich_MODEL env var
-	if envPath := os.Getenv("sittich_MODEL"); envPath != "" {
-		if isValidModel(envPath) {
-			return envPath, nil
-		}
-		fmt.Fprintf(os.Stderr, "Warning: sittich_MODEL=%s not found or invalid\n", envPath)
+	// 1. Check if model is already in dataDir
+	if isValidModel(dataDir) {
+		return dataDir, nil
 	}
 
-	// 3. Check cache directory
-	cacheDir := getCacheDir()
-	modelDir := filepath.Join(cacheDir, "sittich", "models", DefaultModelName)
-
-	if isValidModel(modelDir) {
-		return modelDir, nil
-	}
-
-	// 4. Download model
-	fmt.Fprintf(os.Stderr, "Downloading model to %s...\n", modelDir)
-	if err := downloadAndExtract(modelDir); err != nil {
+	// 2. Download model to dataDir
+	fmt.Fprintf(os.Stderr, "Downloading model to %s...\n", dataDir)
+	if err := downloadAndExtract(dataDir); err != nil {
 		return "", fmt.Errorf("failed to download model: %w", err)
 	}
 
-	return modelDir, nil
-}
-
-func getCacheDir() string {
-	if xdg := os.Getenv("XDG_CACHE_HOME"); xdg != "" {
-		return xdg
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return ".cache"
-	}
-	return filepath.Join(home, ".cache")
+	return dataDir, nil
 }
 
 func isValidModel(path string) bool {

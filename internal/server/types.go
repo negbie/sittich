@@ -60,8 +60,7 @@ type HealthResponse struct {
 
 // ServerOptions holds server configuration
 type ServerOptions struct {
-	Host         string
-	Port         int
+	ListenAddr   string
 	MaxUploadMB  int64
 	Workers      int
 	MaxQueueSize int
@@ -71,8 +70,7 @@ type ServerOptions struct {
 // DefaultServerOptions returns default server options
 func DefaultServerOptions() *ServerOptions {
 	return &ServerOptions{
-		Host:         "0.0.0.0",
-		Port:         8080,
+		ListenAddr:   ":8080",
 		MaxUploadMB:  1024,
 		Workers:      2,
 		MaxQueueSize: 10,
