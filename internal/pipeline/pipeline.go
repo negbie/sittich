@@ -139,11 +139,12 @@ func (p *Pipeline) TranscribeFile(ctx context.Context, path string, opts types.O
 	}
 
 	merged := p.mergeOptions(opts)
-	return p.processAudioInternal(ctx, samples, sampleRate, channels, merged)
+	return p.processAudioInternal(ctx, samples, sampleRate, channels, merged, p.config.ChunkDuration)
 }
 
 // Process decodes the audio file at audioPath and runs the pipeline.
-func (p *Pipeline) Process(ctx context.Context, audioPath string) (*types.Result, error) {
+// If chunkDuration is > 0, it overrides the pipeline's default setting.
+func (p *Pipeline) Process(ctx context.Context, audioPath string, chunkDuration float64) (*types.Result, error) {
 	samples, sampleRate, channels, err := decodeAudioFile(audioPath)
 	if err != nil {
 		return nil, fmt.Errorf("pipeline: decode: %w", err)
@@ -154,21 +155,31 @@ func (p *Pipeline) Process(ctx context.Context, audioPath string) (*types.Result
 		WordTimestamps: p.config.WordTimestamps,
 		Debug:          p.Debug,
 	}
-	return p.processAudioInternal(ctx, samples, sampleRate, channels, opts)
+
+	if chunkDuration <= 0 {
+		chunkDuration = p.config.ChunkDuration
+	}
+
+	return p.processAudioInternal(ctx, samples, sampleRate, channels, opts, chunkDuration)
 }
 
 // ProcessAudio runs the pipeline on pre-decoded audio samples.
-func (p *Pipeline) ProcessAudio(ctx context.Context, samples []float32, sampleRate int) (*types.Result, error) {
+func (p *Pipeline) ProcessAudio(ctx context.Context, samples []float32, sampleRate int, chunkDuration float64) (*types.Result, error) {
 	opts := types.Options{
 		Language:       p.config.Language,
 		WordTimestamps: p.config.WordTimestamps,
 		Debug:          p.Debug,
 	}
-	return p.processAudioInternal(ctx, samples, sampleRate, 1, opts)
+
+	if chunkDuration <= 0 {
+		chunkDuration = p.config.ChunkDuration
+	}
+
+	return p.processAudioInternal(ctx, samples, sampleRate, 1, opts, chunkDuration)
 }
 
 // processAudioInternal is the core pipeline implementation.
-func (p *Pipeline) processAudioInternal(ctx context.Context, samples []float32, sampleRate int, channels int, opts types.Options) (*types.Result, error) {
+func (p *Pipeline) processAudioInternal(ctx context.Context, samples []float32, sampleRate int, channels int, opts types.Options, chunkDuration float64) (*types.Result, error) {
 	const targetRate = 16000
 
 	totalStart := time.Now()
@@ -238,7 +249,7 @@ func (p *Pipeline) processAudioInternal(ctx context.Context, samples []float32, 
 	}
 
 	chunkStart := time.Now()
-	chunks := ChunkSpeechSegments(segments, p.config.ChunkDuration)
+	chunks := ChunkSpeechSegments(segments, chunkDuration)
 	chunkElapsed := time.Since(chunkStart)
 	if p.Debug {
 		fmt.Fprintf(os.Stderr, "   [Pipeline] Stage chunking=%s chunks=%d max_chunk=%.2fs\n", chunkElapsed.Round(time.Millisecond), len(chunks), p.config.ChunkDuration)

@@ -104,7 +104,7 @@ func run(args []string) error {
 		startTime := time.Now()
 		fmt.Fprintf(os.Stderr, "Transcribing...\r")
 
-		result, err := pipe.Process(context.Background(), audioFile)
+		result, err := pipe.Process(context.Background(), audioFile, float64(opts.ChunkSize))
 		if err != nil {
 			return fmt.Errorf("transcription failed: %w", err)
 		}

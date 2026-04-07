@@ -27,7 +27,7 @@ var (
 )
 
 const (
-	defaultChunkSize      = 60
+	defaultChunkSize      = 20
 	defaultFormat         = "text"
 	defaultMaxActivePaths = 2
 	defaultDecodingMethod = "greedy_search"

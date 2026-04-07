@@ -140,7 +140,7 @@ func (p *Pool) processJobWithPipeline(workerID int, job *server.Job, pipe *pipel
 
 	startTime := time.Now()
 
-	result, err := pipe.Process(job.Ctx, job.FilePath)
+	result, err := pipe.Process(job.Ctx, job.FilePath, float64(job.ChunkSize))
 	if err != nil {
 		if p.debug {
 			fmt.Fprintf(os.Stderr, "[Worker %d] Job %s failed processing_time=%s err=%v\n", workerID, job.ID, time.Since(startTime).Round(time.Millisecond), err)
