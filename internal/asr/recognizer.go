@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 
@@ -36,13 +37,26 @@ func NewRecognizer(cfg *Config) (*Recognizer, error) {
 				Decoder: filepath.Join(cfg.ModelPath, models.DecoderFile),
 				Joiner:  filepath.Join(cfg.ModelPath, models.JoinerFile),
 			},
-			Tokens:     filepath.Join(cfg.ModelPath, models.TokensFile),
-			NumThreads: 4,
-			Provider:   "cpu",
-			ModelType:  "nemo_transducer",
+			Tokens:    filepath.Join(cfg.ModelPath, models.TokensFile),
+			Provider:  "cpu",
+			ModelType: "nemo_transducer",
 		},
 		DecodingMethod: cfg.DecodingMethod,
 		MaxActivePaths: cfg.MaxActivePaths,
+	}
+
+	// If NumThreads is 0, we auto-detect based on available cores and worker count.
+	// This prevents the "over-subscription" issue during concurrent transcription.
+	if cfg.NumThreads <= 0 {
+		availableCores := runtime.NumCPU()
+		// If we don't know the worker count, we default to a conservative 1/4 of cores.
+		// However, cfg should ideally handle this.
+		sherpaConfig.ModelConfig.NumThreads = availableCores / 4
+		if sherpaConfig.ModelConfig.NumThreads < 1 {
+			sherpaConfig.ModelConfig.NumThreads = 1
+		}
+	} else {
+		sherpaConfig.ModelConfig.NumThreads = 4
 	}
 
 	recognizer := sherpa.NewOfflineRecognizer(&sherpaConfig)
@@ -99,8 +113,8 @@ func (r *Recognizer) Transcribe(ctx context.Context, audio []float32, sampleRate
 	}()
 
 	// Process audio
-	calibrated := calibrateAudio(audio)
-	stream.AcceptWaveform(sampleRate, calibrated)
+	calibrateAudio(audio)
+	stream.AcceptWaveform(sampleRate, audio)
 	r.recognizer.Decode(stream)
 
 	// Get result
@@ -188,11 +202,12 @@ func (r *Recognizer) Close() error {
 	return nil
 }
 
-// calibrateAudio adjusts the signal for Parakeet-TDT INT8 calibration.
+// calibrateAudio adjusts the signal in-place for Parakeet-TDT INT8 calibration.
 // It ensures the target intensity and acoustic floor requirements are met.
-func calibrateAudio(audio []float32) []float32 {
+// This is a zero-allocation operation to reduce GC pressure on large files.
+func calibrateAudio(audio []float32) {
 	if len(audio) == 0 {
-		return audio
+		return
 	}
 
 	maxVal := float32(0)
@@ -209,15 +224,17 @@ func calibrateAudio(audio []float32) []float32 {
 	}
 
 	if maxVal < 1e-4 {
-		return audio // Too quiet, avoid boosting noise
+		return // Too quiet, avoid boosting noise
 	}
 
+	// Calculate scale to target ~200.0 peak.
+	// This corresponds to approximately 5.4 log-units after feature extraction,
+	// which is the required activation level for Parakeet-TDT INT8 calibration.
 	scale := 200.0 / maxVal
-	calibrated := make([]float32, len(audio))
 
 	const floor = 1e-20
 	for i, v := range audio {
-		// Apply peak scaling
+		// Apply peak scaling in-place
 		nv := v * scale
 
 		// Ensure acoustic floor
@@ -226,8 +243,6 @@ func calibrateAudio(audio []float32) []float32 {
 		} else if nv < 0 && nv > -floor {
 			nv = -floor
 		}
-		calibrated[i] = nv
+		audio[i] = nv
 	}
-
-	return calibrated
 }

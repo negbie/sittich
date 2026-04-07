@@ -21,7 +21,7 @@ endif
 
 .PHONY: all build build-local stage-libs bundle run clean help
 
-all: build
+all: bundle
 
 help:
 	@echo "sittich build system"

@@ -31,8 +31,8 @@ const (
 	defaultFormat         = "text"
 	defaultMaxActivePaths = 2
 	defaultDecodingMethod = "greedy_search"
-	defaultWorkers        = 2
-	defaultMaxUploadMB    = 1024
+	defaultWorkers        = 4
+	defaultMaxUploadMB    = 32
 )
 
 type cliOptions struct {
