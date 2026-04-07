@@ -1,5 +1,4 @@
 # Binaries
-dist/
 *.exe
 *.dll
 *.so
@@ -54,4 +53,6 @@ sherpa-onnx-*/
 # Development files (not committed)
 todo.md
 
+bin/
+dist/
 data/

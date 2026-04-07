@@ -39,9 +39,6 @@ type PipelineConfig struct {
 	// Only required when VADEnabled is true.
 	VADModelPath string
 
-	// ParallelChunks is the number of chunks to process in parallel.
-	ParallelChunks int
-
 	// Debug enables detailed console logging.
 	Debug bool
 }
@@ -63,8 +60,7 @@ func New(eng types.Engine) *Pipeline {
 		engine:     eng,
 		OwnsEngine: false, // Default to false when eng is provided
 		config: PipelineConfig{
-			ChunkDuration:  DefaultChunkDuration,
-			ParallelChunks: 1,
+			ChunkDuration: DefaultChunkDuration,
 		},
 	}
 	if eng != nil {

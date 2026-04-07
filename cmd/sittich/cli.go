@@ -33,7 +33,6 @@ const (
 	defaultDecodingMethod = "modified_beam_search"
 	defaultWorkers        = 2
 	defaultMaxUploadMB    = 1024
-	defaultParallelChunks = 1
 )
 
 type cliOptions struct {
@@ -46,7 +45,6 @@ type cliOptions struct {
 	MaxActivePaths int
 	DecodingMethod string
 
-	ParallelChunks int
 	DataFolder     string
 	RemoteURL      string
 	ListenAddr     string
@@ -81,7 +79,6 @@ var allFlags = []cliFlag{
 	{long: "max-active-paths", arg: "int", description: "number of active paths for modified beam search", defaultVal: "4"},
 	{long: "decoding-method", arg: "string", description: "decoding method: greedy_search or modified_beam_search", defaultVal: defaultDecodingMethod},
 	{long: "data-folder", arg: "path", description: "path to model directory"},
-	{long: "parallel-chunks", arg: "int", description: "number of chunks to process in parallel", defaultVal: "1"},
 	{long: "version", description: "show version"},
 }
 
@@ -128,7 +125,6 @@ func parseCLI(args []string) (cliOptions, error) {
 	workers := fs.Int("workers", defaultWorkers, "concurrent workers")
 	maxUploadMB := fs.Int("max-upload", defaultMaxUploadMB, "max upload size in MB")
 	debug := fs.Bool("debug", false, "show detailed debug logs")
-	parallelChunks := fs.Int("parallel-chunks", defaultParallelChunks, "number of chunks to process in parallel")
 	dataFolder := fs.String("data-folder", "", "path to model directory")
 
 	fs.Usage = func() {
@@ -152,7 +148,6 @@ func parseCLI(args []string) (cliOptions, error) {
 		Workers:        *workers,
 		MaxUploadMB:    *maxUploadMB,
 		Debug:          *debug,
-		ParallelChunks: *parallelChunks,
 		DataFolder:     *dataFolder,
 		RemoteURL:      *remoteURL,
 		ListenAddr:     *listenAddr,

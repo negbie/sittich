@@ -2,7 +2,7 @@
 # Build & Bundle Makefile
 
 BINARY_NAME := sittich
-DIST_DIR := dist
+BIN_DIR := bin
 GO_OS := $(shell go env GOOS)
 GO_ARCH := $(shell go env GOARCH)
 VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
@@ -27,7 +27,7 @@ help:
 	@echo "sittich build system"
 	@echo ""
 	@echo "Targets:"
-	@echo "  build         Build the binary to $(DIST_DIR)/"
+	@echo "  build         Build the binary to $(BIN_DIR)/"
 	@echo "  stage-libs    Extract shared libraries from Go mod cache"
 	@echo "  bundle        Build binary, copy libs, and patch runtime paths (Linux/macOS)"
 	@echo "  run           Build and run locally with LD_LIBRARY_PATH"
@@ -37,8 +37,8 @@ help:
 # Build the Go binary
 build:
 	@echo "Building $(BINARY_NAME) $(VERSION)..."
-	@mkdir -p $(DIST_DIR)
-	go build -o $(DIST_DIR)/$(BINARY_NAME) ./cmd/sittich
+	@mkdir -p $(BIN_DIR)
+	go build -o $(BIN_DIR)/$(BINARY_NAME) ./cmd/sittich
 
 # Step 1: Stage libraries from Go mod cache to /tmp/sittich-libbundle
 stage-libs:
@@ -48,11 +48,11 @@ stage-libs:
 # Step 2: Full bundle (build + libs + rpath fix)
 bundle: build stage-libs
 	@echo "Bundling libraries for $(LIB_PLATFORM)..."
-	@cp -f /tmp/sittich-libbundle/$(LIB_PLATFORM)/*.$(LIB_EXT) $(DIST_DIR)/
+	@cp -f /tmp/sittich-libbundle/$(LIB_PLATFORM)/*.$(LIB_EXT) $(BIN_DIR)/
 	@echo "Patching runtime paths..."
-	@bash ./scripts/fix-runtime-paths.sh $(DIST_DIR)/$(BINARY_NAME) $(GO_OS) $(GO_ARCH)
-	@echo "Bundle ready in $(DIST_DIR)/"
-	@ls -sh $(DIST_DIR)/
+	@bash ./scripts/fix-runtime-paths.sh $(BIN_DIR)/$(BINARY_NAME) $(GO_OS) $(GO_ARCH)
+	@echo "Bundle ready in $(BIN_DIR)/"
+	@ls -sh $(BIN_DIR)/
 
 # Local build Alias
 build-local: build
@@ -60,11 +60,11 @@ build-local: build
 # Run locally without patching (using LD_LIBRARY_PATH)
 run: build stage-libs
 	@echo "Running $(BINARY_NAME)..."
-	@LD_LIBRARY_PATH=$(LD_LIBRARY_PATH):/tmp/sittich-libbundle/$(LIB_PLATFORM) ./$(DIST_DIR)/$(BINARY_NAME) $(ARGS)
+	@LD_LIBRARY_PATH=$(LD_LIBRARY_PATH):/tmp/sittich-libbundle/$(LIB_PLATFORM) ./$(BIN_DIR)/$(BINARY_NAME) $(ARGS)
 
 # Clean build artifacts
 clean:
 	@echo "Cleaning..."
-	rm -rf $(DIST_DIR)
+	rm -rf $(BIN_DIR)
 	go clean -cache
 
