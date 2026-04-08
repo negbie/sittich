@@ -6,8 +6,11 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/negbie/sittich/internal/asr"
 )
 
 var (
@@ -27,23 +30,40 @@ var (
 )
 
 const (
-	defaultChunkSize      = 20
-	defaultFormat         = "text"
-	defaultMaxActivePaths = 2
-	defaultDecodingMethod = "greedy_search"
-	defaultWorkers        = 4
-	defaultMaxUploadMB    = 32
+	defaultChunkSize              = 40
+	defaultChunkMinTail           = 1.5
+	defaultFormat                 = "text"
+	defaultMaxActivePaths         = 1
+	defaultDecodingMethod         = "modified_beam_search"
+	defaultWorkers                = 4
+	defaultMaxUploadMB            = 32
+	defaultVADThreshold           = 0.5
+	defaultVADMinSilence          = 0.7
+	defaultVADMinSpeech           = 0.25
+	defaultVADSegmentPadding      = 0.0
+	defaultCalibrationTargetPeak  = 120.0
+	defaultCalibrationMaxGain     = 180.0
+	defaultCalibrationMaxMSamples = 8192
 )
 
 type cliOptions struct {
 	// CLI mode
-	AudioFile      string
-	ChunkSize      int
-	Format         string
-	OutputFile     string
-	ShowVersion    bool
-	MaxActivePaths int
-	DecodingMethod string
+	AudioFile              string
+	ChunkSize              int
+	ChunkMinTailDuration   float64
+	Format                 string
+	OutputFile             string
+	ShowVersion            bool
+	MaxActivePaths         int
+	DecodingMethod         string
+	NoVAD                  bool
+	VADThreshold           float64
+	VADMinSilenceDuration  float64
+	VADMinSpeechDuration   float64
+	VADSegmentPadding      float64
+	CalibrationTargetPeak  float64
+	CalibrationMaxGain     float64
+	CalibrationMaxMSamples int
 
 	DataFolder  string
 	RemoteURL   string
@@ -68,16 +88,25 @@ type usageRow struct {
 }
 
 var allFlags = []cliFlag{
-	{long: "chunk-size", arg: "int", description: "chunk size in seconds", defaultVal: "60"},
+	{long: "chunk-size", arg: "int", description: "chunk size in seconds", defaultVal: strconv.Itoa(defaultChunkSize)},
+	{long: "chunk-min-tail", arg: "float", description: "minimum tail duration when balancing oversized chunks in seconds", defaultVal: strconv.FormatFloat(defaultChunkMinTail, 'f', 1, 64)},
 	{long: "format", arg: "string", description: "output format: text, json, vtt", defaultVal: defaultFormat},
 	{long: "output", arg: "file", description: "output file", defaultVal: "stdout"},
 	{long: "remote-url", arg: "string", description: "transcribe via remote server"},
 	{long: "listen", arg: "address", description: "listen address"},
-	{long: "workers", arg: "int", description: "concurrent workers", defaultVal: "2"},
-	{long: "max-upload", arg: "int", description: "max upload size in MB", defaultVal: "1024"},
+	{long: "workers", arg: "int", description: "concurrent workers", defaultVal: strconv.Itoa(defaultWorkers)},
+	{long: "max-upload", arg: "int", description: "max upload size in MB", defaultVal: strconv.Itoa(defaultMaxUploadMB)},
 	{long: "debug", description: "show detailed debug logs"},
-	{long: "max-active-paths", arg: "int", description: "number of active paths for modified beam search", defaultVal: "4"},
+	{long: "max-active-paths", arg: "int", description: "number of active paths for modified beam search", defaultVal: strconv.Itoa(defaultMaxActivePaths)},
 	{long: "decoding-method", arg: "string", description: "decoding method: greedy_search or modified_beam_search", defaultVal: defaultDecodingMethod},
+	{long: "no-vad", description: "disable VAD for local transcription"},
+	{long: "vad-threshold", arg: "float", description: "VAD speech threshold", defaultVal: strconv.FormatFloat(defaultVADThreshold, 'f', 1, 64)},
+	{long: "vad-min-silence", arg: "float", description: "minimum silence duration for VAD splits in seconds", defaultVal: strconv.FormatFloat(defaultVADMinSilence, 'f', 1, 64)},
+	{long: "vad-min-speech", arg: "float", description: "minimum speech duration for VAD segments in seconds", defaultVal: strconv.FormatFloat(defaultVADMinSpeech, 'f', 2, 64)},
+	{long: "vad-segment-padding", arg: "float", description: "padding added to both sides of each VAD segment in seconds", defaultVal: strconv.FormatFloat(defaultVADSegmentPadding, 'f', 1, 64)},
+	{long: "calibration-target-peak", arg: "float", description: "target robust peak used for audio calibration", defaultVal: strconv.FormatFloat(defaultCalibrationTargetPeak, 'f', 1, 64)},
+	{long: "calibration-max-gain", arg: "float", description: "maximum gain applied during audio calibration", defaultVal: strconv.FormatFloat(defaultCalibrationMaxGain, 'f', 1, 64)},
+	{long: "calibration-max-samples", arg: "int", description: "maximum sampled points used for calibration peak estimation", defaultVal: strconv.Itoa(defaultCalibrationMaxMSamples)},
 	{long: "data-folder", arg: "path", description: "path to model directory"},
 	{long: "version", description: "show version"},
 }
@@ -113,12 +142,21 @@ func parseCLI(args []string) (cliOptions, error) {
 
 	// CLI flags
 	chunkSize := fs.Int("chunk-size", defaultChunkSize, "chunk size in seconds")
+	chunkMinTail := fs.Float64("chunk-min-tail", defaultChunkMinTail, "minimum tail duration when balancing oversized chunks in seconds")
 	format := fs.String("format", defaultFormat, "output format (text, json, vtt)")
 	outputFile := fs.String("output", "", "output file")
 	showVersion := fs.Bool("version", false, "show version")
 	remoteURL := fs.String("remote-url", "", "transcribe via remote server")
 	maxActivePaths := fs.Int("max-active-paths", defaultMaxActivePaths, "number of active paths for modified beam search")
 	decodingMethod := fs.String("decoding-method", defaultDecodingMethod, "decoding method: greedy_search or modified_beam_search")
+	noVAD := fs.Bool("no-vad", false, "disable VAD for local transcription")
+	vadThreshold := fs.Float64("vad-threshold", defaultVADThreshold, "VAD speech threshold")
+	vadMinSilence := fs.Float64("vad-min-silence", defaultVADMinSilence, "minimum silence duration for VAD splits in seconds")
+	vadMinSpeech := fs.Float64("vad-min-speech", defaultVADMinSpeech, "minimum speech duration for VAD segments in seconds")
+	vadSegmentPadding := fs.Float64("vad-segment-padding", defaultVADSegmentPadding, "padding added to both sides of each VAD segment in seconds")
+	calibrationTargetPeak := fs.Float64("calibration-target-peak", defaultCalibrationTargetPeak, "target robust peak used for audio calibration")
+	calibrationMaxGain := fs.Float64("calibration-max-gain", defaultCalibrationMaxGain, "maximum gain applied during audio calibration")
+	calibrationMaxSamples := fs.Int("calibration-max-samples", defaultCalibrationMaxMSamples, "maximum sampled points used for calibration peak estimation")
 
 	// Server flags
 	listenAddr := fs.String("listen", "", "listen address")
@@ -139,18 +177,27 @@ func parseCLI(args []string) (cliOptions, error) {
 	}
 
 	opts := cliOptions{
-		ChunkSize:      *chunkSize,
-		Format:         strings.ToLower(*format),
-		OutputFile:     *outputFile,
-		ShowVersion:    *showVersion,
-		MaxActivePaths: *maxActivePaths,
-		DecodingMethod: strings.ToLower(*decodingMethod),
-		Workers:        *workers,
-		MaxUploadMB:    *maxUploadMB,
-		Debug:          *debug,
-		DataFolder:     *dataFolder,
-		RemoteURL:      *remoteURL,
-		ListenAddr:     *listenAddr,
+		ChunkSize:              *chunkSize,
+		ChunkMinTailDuration:   *chunkMinTail,
+		Format:                 strings.ToLower(*format),
+		OutputFile:             *outputFile,
+		ShowVersion:            *showVersion,
+		MaxActivePaths:         *maxActivePaths,
+		DecodingMethod:         strings.ToLower(*decodingMethod),
+		NoVAD:                  *noVAD,
+		VADThreshold:           *vadThreshold,
+		VADMinSilenceDuration:  *vadMinSilence,
+		VADMinSpeechDuration:   *vadMinSpeech,
+		VADSegmentPadding:      *vadSegmentPadding,
+		CalibrationTargetPeak:  *calibrationTargetPeak,
+		CalibrationMaxGain:     *calibrationMaxGain,
+		CalibrationMaxMSamples: *calibrationMaxSamples,
+		Workers:                *workers,
+		MaxUploadMB:            *maxUploadMB,
+		Debug:                  *debug,
+		DataFolder:             *dataFolder,
+		RemoteURL:              *remoteURL,
+		ListenAddr:             *listenAddr,
 	}
 
 	if opts.ShowVersion || opts.ListenAddr != "" {
@@ -177,6 +224,30 @@ func parseCLI(args []string) (cliOptions, error) {
 	if opts.MaxActivePaths < 1 {
 		return cliOptions{}, fmt.Errorf("%w: max-active-paths must be >= 1", errInvalidArgs)
 	}
+	if opts.ChunkMinTailDuration < 0 {
+		return cliOptions{}, fmt.Errorf("%w: chunk-min-tail must be >= 0", errInvalidArgs)
+	}
+	if opts.VADThreshold <= 0 {
+		return cliOptions{}, fmt.Errorf("%w: vad-threshold must be > 0", errInvalidArgs)
+	}
+	if opts.VADMinSilenceDuration <= 0 {
+		return cliOptions{}, fmt.Errorf("%w: vad-min-silence must be > 0", errInvalidArgs)
+	}
+	if opts.VADMinSpeechDuration <= 0 {
+		return cliOptions{}, fmt.Errorf("%w: vad-min-speech must be > 0", errInvalidArgs)
+	}
+	if opts.VADSegmentPadding < 0 {
+		return cliOptions{}, fmt.Errorf("%w: vad-segment-padding must be >= 0", errInvalidArgs)
+	}
+	if opts.CalibrationTargetPeak <= 0 {
+		return cliOptions{}, fmt.Errorf("%w: calibration-target-peak must be > 0", errInvalidArgs)
+	}
+	if opts.CalibrationMaxGain <= 0 {
+		return cliOptions{}, fmt.Errorf("%w: calibration-max-gain must be > 0", errInvalidArgs)
+	}
+	if opts.CalibrationMaxMSamples <= 0 {
+		return cliOptions{}, fmt.Errorf("%w: calibration-max-samples must be > 0", errInvalidArgs)
+	}
 
 	switch opts.DecodingMethod {
 	case "greedy_search", "modified_beam_search":
@@ -185,6 +256,17 @@ func parseCLI(args []string) (cliOptions, error) {
 	}
 
 	return opts, nil
+}
+
+func recognizerConfigFromCLI(opts cliOptions, modelPath string) *asr.Config {
+	return &asr.Config{
+		ModelPath:              modelPath,
+		DecodingMethod:         opts.DecodingMethod,
+		MaxActivePaths:         opts.MaxActivePaths,
+		CalibrationTargetPeak:  float32(opts.CalibrationTargetPeak),
+		CalibrationMaxGain:     float32(opts.CalibrationMaxGain),
+		CalibrationMaxMSamples: opts.CalibrationMaxMSamples,
+	}
 }
 
 func formatFlagLabel(f cliFlag) string {
@@ -256,7 +338,7 @@ func printUsage() {
 
 	fmt.Fprintf(os.Stderr, "%sExamples:%s\n", bold, reset)
 	exampleRows := []usageRow{
-		{label: fmt.Sprintf("%s$%s sittich audio.wav", green, reset), plainLabel: "$ sittich audio.wav", desc: fmt.Sprintf("%s# 60s chunks, text output%s", dim, reset)},
+		{label: fmt.Sprintf("%s$%s sittich audio.wav", green, reset), plainLabel: "$ sittich audio.wav", desc: fmt.Sprintf("%s# %ds chunks, text output%s", dim, defaultChunkSize, reset)},
 		{label: fmt.Sprintf("%s$%s cat audio.wav | sittich", green, reset), plainLabel: "$ cat audio.wav | sittich", desc: fmt.Sprintf("%s# transcribe from pipe%s", dim, reset)},
 		{label: fmt.Sprintf("%s$%s sittich --chunk-size 30 talk.wav", green, reset), plainLabel: "$ sittich --chunk-size 30 talk.wav", desc: fmt.Sprintf("%s# 30s chunks%s", dim, reset)},
 		{label: fmt.Sprintf("%s$%s sittich --remote-url http://localhost:8080 audio.wav", green, reset), plainLabel: "$ sittich --remote-url http://localhost:8080 audio.wav", desc: fmt.Sprintf("%s# transcribe via remote server%s", dim, reset)},

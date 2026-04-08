@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 )
 
 //go:embed libs/*
@@ -52,7 +53,7 @@ func Bootstrap() {
 
 	// 4. Re-execute the binary.
 	cmd := exec.Command(os.Args[0], os.Args[1:]...)
-	cmd.Env = append(os.Environ(), 
+	cmd.Env = append(os.Environ(),
 		fmt.Sprintf("%s=1", envSignal),
 		fmt.Sprintf("%s=%s", envPathKey(), newPath),
 	)
@@ -81,7 +82,6 @@ func envPathKey() string {
 	}
 }
 
-
 func peekDataFolder() string {
 	for i := 1; i < len(os.Args); i++ {
 		arg := os.Args[i]
@@ -104,32 +104,68 @@ func extractLibs(targetDir string) error {
 	platformDir := fmt.Sprintf("libs/%s_%s", runtime.GOOS, runtime.GOARCH)
 	entries, err := libFiles.ReadDir(platformDir)
 	if err != nil {
-		// If no libs are found for this platform, assume they are already on the system
-		// or not required for this build.
 		return nil
 	}
 
 	if _, err := os.Stat(targetDir); err == nil {
-		// Already exists. In production we might want to check versions/checksums.
 		return nil
 	}
 
-	if err := os.MkdirAll(targetDir, 0755); err != nil {
-		return fmt.Errorf("create lib dir: %w", err)
+	if err := os.MkdirAll(filepath.Dir(targetDir), 0755); err != nil {
+		return fmt.Errorf("create lib parent dir: %w", err)
 	}
+
+	lockFile := targetDir + ".lock"
+	var success bool
+	for i := 0; i < 60; i++ { // Wait up to 30 seconds
+		f, err := os.OpenFile(lockFile, os.O_CREATE|os.O_EXCL, 0644)
+		if err == nil {
+			f.Close()
+			defer os.Remove(lockFile)
+			success = true
+			break
+		}
+		if !os.IsExist(err) {
+			return fmt.Errorf("acquire extraction lock: %w", err)
+		}
+		// If lock exists, check if targetDir was created in the meantime
+		if _, err := os.Stat(targetDir); err == nil {
+			return nil
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	if !success {
+		return fmt.Errorf("timeout waiting for library extraction lock")
+	}
+
+	if _, err := os.Stat(targetDir); err == nil {
+		return nil
+	}
+
+	tmpDir := targetDir + ".tmp"
+	_ = os.RemoveAll(tmpDir)
+	if err := os.MkdirAll(tmpDir, 0755); err != nil {
+		return fmt.Errorf("create temp lib dir: %w", err)
+	}
+	defer os.RemoveAll(tmpDir)
 
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
 		}
-		
+
 		srcPath := filepath.Join(platformDir, entry.Name())
-		dstPath := filepath.Join(targetDir, entry.Name())
-		
+		dstPath := filepath.Join(tmpDir, entry.Name())
+
 		if err := copyFile(srcPath, dstPath); err != nil {
 			return fmt.Errorf("extract %s: %w", entry.Name(), err)
 		}
 	}
+
+	if err := os.Rename(tmpDir, targetDir); err != nil {
+		return fmt.Errorf("finalize lib extraction: %w", err)
+	}
+
 	return nil
 }
 

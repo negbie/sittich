@@ -8,7 +8,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/negbie/sittich/internal/asr"
+	"github.com/negbie/sittich/internal/pipeline"
 	"github.com/negbie/sittich/internal/server"
 	"github.com/negbie/sittich/internal/worker"
 )
@@ -19,11 +19,7 @@ func runServer(opts *cliOptions) error {
 	defer showCursor()
 
 	fmt.Fprint(os.Stderr, "Loading model...\r")
-	cfg := &asr.Config{
-		ModelPath:      opts.DataFolder,
-		DecodingMethod: opts.DecodingMethod,
-		MaxActivePaths: opts.MaxActivePaths,
-	}
+	cfg := recognizerConfigFromCLI(*opts, opts.DataFolder)
 
 	recognizer, err := server.LoadRecognizer(cfg)
 	if err != nil {
@@ -41,7 +37,23 @@ func runServer(opts *cliOptions) error {
 		MaxQueueSize: 10,
 		Debug:        opts.Debug,
 	}
-	pool := worker.NewPool(opts.Workers, 10, recognizer, opts.Debug, opts.DataFolder)
+	pool := worker.NewPool(
+		opts.Workers,
+		10,
+		recognizer,
+		pipeline.PipelineConfig{
+			VADEnabled:            !opts.NoVAD,
+			ChunkDuration:         float64(opts.ChunkSize),
+			ChunkMinTailDuration:  opts.ChunkMinTailDuration,
+			VADThreshold:          float32(opts.VADThreshold),
+			VADMinSilenceDuration: float32(opts.VADMinSilenceDuration),
+			VADMinSpeechDuration:  float32(opts.VADMinSpeechDuration),
+			VADSegmentPadding:     opts.VADSegmentPadding,
+			Debug:                 opts.Debug,
+		},
+		opts.Debug,
+		opts.DataFolder,
+	)
 	defer pool.Shutdown()
 
 	// Create HTTP server
@@ -52,8 +64,6 @@ func runServer(opts *cliOptions) error {
 	fmt.Fprintf(os.Stderr, "   Server running on http://%s\n", opts.ListenAddr)
 	fmt.Fprintf(os.Stderr, "   POST /transcribe - Transcribe audio\n")
 	fmt.Fprintf(os.Stderr, "   GET  /health     - Health check\n")
-	fmt.Fprintf(os.Stderr, "   defaults: format=%s chunk-size=%ds decoding=%s max-active-paths=%d\n",
-		opts.Format, opts.ChunkSize, opts.DecodingMethod, opts.MaxActivePaths)
 	fmt.Fprintf(os.Stderr, "\nPress Ctrl+C to stop\n")
 
 	// Handle shutdown

@@ -27,13 +27,13 @@ type SpeechSegment struct {
 }
 
 // NewVAD creates a VAD configuration wrapper and initializes detector ownership.
-func NewVAD(modelPath string) (*VAD, error) {
+func NewVAD(modelPath string, threshold, minSilenceDuration, minSpeechDuration float32) (*VAD, error) {
 	config := sherpa.VadModelConfig{
 		SileroVad: sherpa.SileroVadModelConfig{
 			Model:              modelPath,
-			Threshold:          0.5,
-			MinSilenceDuration: 0.5,
-			MinSpeechDuration:  0.25,
+			Threshold:          threshold,
+			MinSilenceDuration: minSilenceDuration,
+			MinSpeechDuration:  minSpeechDuration,
 			WindowSize:         512,
 		},
 		SampleRate: 16000,
@@ -87,16 +87,26 @@ func (v *VAD) releaseDetector(detector *sherpa.VoiceActivityDetector) {
 	detector.Reset()
 
 	v.mu.Lock()
-	closed := v.closed
-	v.mu.Unlock()
-
-	if closed {
+	if v.closed {
+		v.mu.Unlock()
 		return
 	}
+	v.mu.Unlock()
 
 	select {
 	case v.detectors <- detector:
 	default:
+		// Pool is full, delete this extra detector to avoid memory leak
+		sherpa.DeleteVoiceActivityDetector(detector)
+		v.mu.Lock()
+		for i, d := range v.all {
+			if d == detector {
+				v.all[i] = v.all[len(v.all)-1]
+				v.all = v.all[:len(v.all)-1]
+				break
+			}
+		}
+		v.mu.Unlock()
 	}
 }
 

@@ -21,8 +21,7 @@ type Pool struct {
 	workers      int
 	queue        chan *server.Job
 	recognizer   *asr.Recognizer
-	vadModelPath string
-	vadEnabled   bool
+	pipelineCfg  pipeline.PipelineConfig
 	ctx          context.Context
 	cancel       context.CancelFunc
 	wg           sync.WaitGroup
@@ -32,21 +31,21 @@ type Pool struct {
 }
 
 // NewPool creates a new worker pool
-func NewPool(workers int, queueSize int, recognizer *asr.Recognizer, debug bool, dataDir string) *Pool {
+func NewPool(workers int, queueSize int, recognizer *asr.Recognizer, cfg pipeline.PipelineConfig, debug bool, dataDir string) *Pool {
 	ctx, cancel := context.WithCancel(context.Background())
 
-	// Always enable VAD
 	vadPath, _ := models.GetVADPath(dataDir)
+	cfg.VADModelPath = vadPath
+	cfg.VADEnabled = cfg.VADEnabled && vadPath != ""
 
 	p := &Pool{
-		workers:      workers,
-		queue:        make(chan *server.Job, queueSize),
-		recognizer:   recognizer,
-		vadModelPath: vadPath,
-		vadEnabled:   true,
-		ctx:          ctx,
-		cancel:       cancel,
-		debug:        debug,
+		workers:    workers,
+		queue:      make(chan *server.Job, queueSize),
+		recognizer: recognizer,
+		pipelineCfg: cfg,
+		ctx:    ctx,
+		cancel: cancel,
+		debug:  debug,
 	}
 
 	// Start workers
@@ -96,12 +95,7 @@ func (p *Pool) worker(id int) {
 	defer p.wg.Done()
 
 	// 1. Initialise a private Pipeline for this worker.
-	pipe, err := pipeline.NewPipeline(p.recognizer, pipeline.PipelineConfig{
-		VADEnabled:    p.vadEnabled && p.vadModelPath != "",
-		VADModelPath:  p.vadModelPath,
-		ChunkDuration: pipeline.DefaultChunkDuration,
-		Debug:         p.debug,
-	})
+	pipe, err := pipeline.NewPipeline(p.recognizer, p.pipelineCfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Worker %d: failed to initialise pipeline: %v\n", id, err)
 		return

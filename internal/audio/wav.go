@@ -144,6 +144,13 @@ func streamDataChunk(r io.Reader, size uint32, hdr *wavHeader) ([]float32, error
 	if bytesPerSample == 0 {
 		return nil, fmt.Errorf("%w: invalid bits per sample: %d", ErrInvalidWAV, hdr.BitsPerSample)
 	}
+
+	supportedFormat := (hdr.AudioFormat == wavFormatPCM && (hdr.BitsPerSample == 8 || hdr.BitsPerSample == 16)) ||
+		(hdr.AudioFormat == wavFormatFloat && hdr.BitsPerSample == 32)
+	if !supportedFormat {
+		return nil, fmt.Errorf("%w: unsupported WAV format audio_format=%d bits_per_sample=%d", ErrInvalidWAV, hdr.AudioFormat, hdr.BitsPerSample)
+	}
+
 	numSamples := int(size) / bytesPerSample
 	samples := make([]float32, numSamples)
 
@@ -180,8 +187,6 @@ func streamDataChunk(r io.Reader, size uint32, hdr *wavHeader) ([]float32, error
 			case hdr.AudioFormat == wavFormatFloat && hdr.BitsPerSample == 32:
 				bits := binary.LittleEndian.Uint32(buf[off : off+4])
 				samples[idx] = math.Float32frombits(bits)
-			default:
-				// Skip unsupported formats for now
 			}
 		}
 		i += actualRead

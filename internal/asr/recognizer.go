@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"runtime"
 	"strings"
 	"sync"
@@ -43,6 +44,8 @@ func NewRecognizer(cfg *Config) (*Recognizer, error) {
 		},
 		DecodingMethod: cfg.DecodingMethod,
 		MaxActivePaths: cfg.MaxActivePaths,
+		// Mandatory for INT8 German calibration: fix phonetic drift and silence bias.
+		BlankPenalty: 1.2,
 	}
 
 	// If NumThreads is 0, we auto-detect based on available cores and worker count.
@@ -113,7 +116,20 @@ func (r *Recognizer) Transcribe(ctx context.Context, audio []float32, sampleRate
 	}()
 
 	// Process audio
-	calibrateAudio(audio)
+	calibration := r.calibrateAudio(audio)
+	if opts.Debug {
+		fmt.Fprintf(
+			os.Stderr,
+			"   [Recognizer] calibration samples=%d active_ratio=%.4f p99_peak=%.6f scale=%.3f clipped=%d skipped=%v reason=%s\n",
+			len(audio),
+			calibration.ActiveRatio,
+			calibration.Peak,
+			calibration.Scale,
+			calibration.ClippedSamples,
+			calibration.Skipped,
+			calibration.SkipReason,
+		)
+	}
 	stream.AcceptWaveform(sampleRate, audio)
 	r.recognizer.Decode(stream)
 
@@ -202,47 +218,119 @@ func (r *Recognizer) Close() error {
 	return nil
 }
 
+// calibrationStats captures chunk-level calibration behavior for debug logging.
+type calibrationStats struct {
+	ActiveRatio    float64
+	Peak           float32
+	Scale          float32
+	ClippedSamples int
+	Skipped        bool
+	SkipReason     string
+}
+
 // calibrateAudio adjusts the signal in-place for Parakeet-TDT INT8 calibration.
-// It ensures the target intensity and acoustic floor requirements are met.
-// This is a zero-allocation operation to reduce GC pressure on large files.
-func calibrateAudio(audio []float32) {
-	if len(audio) == 0 {
-		return
+// It keeps the original German-friendly robust-peak strategy, but adds light
+// gating and gain caps so silence/noise is less likely to be over-amplified.
+func (r *Recognizer) calibrateAudio(audio []float32) calibrationStats {
+	stats := calibrationStats{
+		Scale:      1.0,
+		Skipped:    true,
+		SkipReason: "empty_audio",
 	}
 
-	maxVal := float32(0)
-	for _, v := range audio {
-		absV := float32(0)
+	n := len(audio)
+	if n == 0 {
+		return stats
+	}
+
+	const (
+		gateThreshold  = 0.003
+		minActiveRatio = 0.01
+		minPeak        = 1e-4
+		minGain        = 1.0
+		clipLimit      = 220.0
+	)
+
+	maxMSamples := 8192
+	targetPeak := float32(180.0)
+	maxGain := float32(200.0)
+
+	if r != nil && r.Config != nil {
+		if r.Config.CalibrationMaxMSamples > 0 {
+			maxMSamples = r.Config.CalibrationMaxMSamples
+		}
+		if r.Config.CalibrationTargetPeak > 0 {
+			targetPeak = r.Config.CalibrationTargetPeak
+		}
+		if r.Config.CalibrationMaxGain > 0 {
+			maxGain = r.Config.CalibrationMaxGain
+		}
+	}
+
+	m := n
+	if m > maxMSamples {
+		m = maxMSamples
+	}
+
+	tmp := make([]float32, 0, m)
+	stride := float64(n) / float64(m)
+
+	for i := 0; i < m; i++ {
+		v := audio[int(float64(i)*stride)]
 		if v < 0 {
-			absV = -v
-		} else {
-			absV = v
+			v = -v
 		}
-		if absV > maxVal {
-			maxVal = absV
+		if v >= gateThreshold {
+			tmp = append(tmp, v)
 		}
 	}
 
-	if maxVal < 1e-4 {
-		return // Too quiet, avoid boosting noise
+	if len(tmp) == 0 {
+		stats.SkipReason = "no_active_samples"
+		return stats
 	}
 
-	// Calculate scale to target ~200.0 peak.
-	// This corresponds to approximately 5.4 log-units after feature extraction,
-	// which is the required activation level for Parakeet-TDT INT8 calibration.
-	scale := 200.0 / maxVal
+	stats.ActiveRatio = float64(len(tmp)) / float64(m)
+	if stats.ActiveRatio < minActiveRatio {
+		stats.SkipReason = "active_ratio_below_threshold"
+		return stats
+	}
 
-	const floor = 1e-20
+	slices.Sort(tmp)
+
+	idx := int(float64(len(tmp)) * 0.99)
+	if idx >= len(tmp) {
+		idx = len(tmp) - 1
+	}
+	peak := tmp[idx]
+	stats.Peak = peak
+
+	if peak < minPeak {
+		stats.SkipReason = "peak_below_threshold"
+		return stats
+	}
+
+	scale := targetPeak / peak
+	if scale < minGain {
+		scale = minGain
+	} else if scale > maxGain {
+		scale = maxGain
+	}
+	stats.Scale = scale
+	stats.Skipped = false
+	stats.SkipReason = ""
+
 	for i, v := range audio {
-		// Apply peak scaling in-place
 		nv := v * scale
-
-		// Ensure acoustic floor
-		if nv > 0 && nv < floor {
-			nv = floor
-		} else if nv < 0 && nv > -floor {
-			nv = -floor
+		if nv > clipLimit {
+			nv = clipLimit
+			stats.ClippedSamples++
+		} else if nv < -clipLimit {
+			nv = -clipLimit
+			stats.ClippedSamples++
 		}
 		audio[i] = nv
 	}
+
+	return stats
 }

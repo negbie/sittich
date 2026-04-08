@@ -85,20 +85,28 @@ func run(args []string) error {
 			fmt.Fprintf(os.Stderr, "Warning: failed to get VAD model: %v. Proceeding without VAD.\n", err)
 		}
 
+		vadEnabled := !opts.NoVAD && vadPath != ""
+
 		// 2. Setup Pipeline
-		pipe, err := pipeline.NewPipeline(recognizer, pipeline.PipelineConfig{
-			VADEnabled:    vadPath != "",
-			VADModelPath:  vadPath,
-			ChunkDuration: float64(opts.ChunkSize),
-			Debug:         opts.Debug,
-		})
+		pipeCfg := pipeline.PipelineConfig{
+			VADEnabled:            vadEnabled,
+			VADModelPath:          vadPath,
+			ChunkDuration:         float64(opts.ChunkSize),
+			ChunkMinTailDuration:  opts.ChunkMinTailDuration,
+			VADThreshold:          float32(opts.VADThreshold),
+			VADMinSilenceDuration: float32(opts.VADMinSilenceDuration),
+			VADMinSpeechDuration:  float32(opts.VADMinSpeechDuration),
+			VADSegmentPadding:     opts.VADSegmentPadding,
+			Debug:                 opts.Debug,
+		}
+		pipe, err := pipeline.NewPipeline(recognizer, pipeCfg)
 		if err != nil {
 			return fmt.Errorf("failed to initialize pipeline: %w", err)
 		}
 		defer pipe.Close()
 
-		fmt.Fprintf(os.Stderr, "audio: %s %s•%s chunks: %ds %s•%s format: %s %s•%s VAD: %v\n",
-			opts.AudioFile, dim, reset, opts.ChunkSize, dim, reset, opts.Format, dim, reset, vadPath != "")
+		fmt.Fprintf(os.Stderr, "audio: %s %s•%s chunks: %ds %s•%s chunk-min-tail: %.2fs %s•%s format: %s %s•%s VAD: %v %s•%s vad-threshold: %.2f %s•%s vad-min-silence: %.2fs %s•%s vad-min-speech: %.2fs %s•%s vad-segment-padding: %.2fs\n",
+			opts.AudioFile, dim, reset, opts.ChunkSize, dim, reset, opts.ChunkMinTailDuration, dim, reset, opts.Format, dim, reset, vadEnabled, dim, reset, opts.VADThreshold, dim, reset, opts.VADMinSilenceDuration, dim, reset, opts.VADMinSpeechDuration, dim, reset, opts.VADSegmentPadding)
 
 		// 3. Transcribe
 		startTime := time.Now()
@@ -154,11 +162,7 @@ func loadRecognizer(opts cliOptions) (*asr.Recognizer, error) {
 		return nil, fmt.Errorf("failed to get model: %w", err)
 	}
 
-	cfg := &asr.Config{
-		ModelPath:      modelPath,
-		DecodingMethod: opts.DecodingMethod,
-		MaxActivePaths: opts.MaxActivePaths,
-	}
+	cfg := recognizerConfigFromCLI(opts, modelPath)
 
 	recognizer, err := asr.NewRecognizer(cfg)
 	if err != nil {
