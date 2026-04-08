@@ -33,16 +33,16 @@ const (
 	defaultChunkSize              = 40
 	defaultChunkMinTail           = 1.5
 	defaultFormat                 = "text"
-	defaultMaxActivePaths         = 1
+	defaultMaxActivePaths         = 2
 	defaultDecodingMethod         = "modified_beam_search"
 	defaultWorkers                = 4
 	defaultMaxUploadMB            = 32
 	defaultVADThreshold           = 0.5
-	defaultVADMinSilence          = 0.7
+	defaultVADMinSilence          = 0.5
 	defaultVADMinSpeech           = 0.25
 	defaultVADSegmentPadding      = 0.0
 	defaultCalibrationTargetPeak  = 120.0
-	defaultCalibrationMaxGain     = 180.0
+	defaultCalibrationMaxGain     = 200.0
 	defaultCalibrationMaxMSamples = 8192
 )
 

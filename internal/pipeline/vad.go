@@ -9,14 +9,11 @@ import (
 	sherpa "github.com/k2-fsa/sherpa-onnx-go/sherpa_onnx"
 )
 
-// VAD wraps a Silero voice-activity detector configuration and explicitly owns
-// a bounded set of reusable detector instances.
+// VAD wraps a Silero voice-activity detector configuration.
 type VAD struct {
-	config    sherpa.VadModelConfig
-	detectors chan *sherpa.VoiceActivityDetector
+	config sherpa.VadModelConfig
 
 	mu     sync.Mutex
-	all    []*sherpa.VoiceActivityDetector
 	closed bool
 }
 
@@ -43,71 +40,8 @@ func NewVAD(modelPath string, threshold, minSilenceDuration, minSpeechDuration f
 	}
 
 	return &VAD{
-		config:    config,
-		detectors: make(chan *sherpa.VoiceActivityDetector, 8),
+		config: config,
 	}, nil
-}
-
-func (v *VAD) acquireDetector() (*sherpa.VoiceActivityDetector, error) {
-	v.mu.Lock()
-	if v.closed {
-		v.mu.Unlock()
-		return nil, fmt.Errorf("vad: detector is closed")
-	}
-	v.mu.Unlock()
-
-	select {
-	case det := <-v.detectors:
-		if det == nil {
-			return nil, fmt.Errorf("vad: acquired nil detector")
-		}
-		return det, nil
-	default:
-		det := sherpa.NewVoiceActivityDetector(&v.config, 30.0)
-		if det == nil {
-			return nil, fmt.Errorf("vad: failed to create detector")
-		}
-
-		v.mu.Lock()
-		defer v.mu.Unlock()
-		if v.closed {
-			sherpa.DeleteVoiceActivityDetector(det)
-			return nil, fmt.Errorf("vad: detector is closed")
-		}
-		v.all = append(v.all, det)
-		return det, nil
-	}
-}
-
-func (v *VAD) releaseDetector(detector *sherpa.VoiceActivityDetector) {
-	if detector == nil {
-		return
-	}
-
-	detector.Reset()
-
-	v.mu.Lock()
-	if v.closed {
-		v.mu.Unlock()
-		return
-	}
-	v.mu.Unlock()
-
-	select {
-	case v.detectors <- detector:
-	default:
-		// Pool is full, delete this extra detector to avoid memory leak
-		sherpa.DeleteVoiceActivityDetector(detector)
-		v.mu.Lock()
-		for i, d := range v.all {
-			if d == detector {
-				v.all[i] = v.all[len(v.all)-1]
-				v.all = v.all[:len(v.all)-1]
-				break
-			}
-		}
-		v.mu.Unlock()
-	}
 }
 
 // DetectSpeech runs a Silero VAD detector over the provided 16 kHz mono audio.
@@ -117,11 +51,18 @@ func (v *VAD) DetectSpeech(audioSamples []float32, sampleRate int) ([]SpeechSegm
 		return nil, fmt.Errorf("vad: expected %d Hz audio, got %d Hz", targetRate, sampleRate)
 	}
 
-	detector, err := v.acquireDetector()
-	if err != nil {
-		return nil, err
+	v.mu.Lock()
+	if v.closed {
+		v.mu.Unlock()
+		return nil, fmt.Errorf("vad: detector is closed")
 	}
-	defer v.releaseDetector(detector)
+	v.mu.Unlock()
+
+	detector := sherpa.NewVoiceActivityDetector(&v.config, 30.0)
+	if detector == nil {
+		return nil, fmt.Errorf("vad: failed to create detector")
+	}
+	defer sherpa.DeleteVoiceActivityDetector(detector)
 
 	windowSize := int(v.config.SileroVad.WindowSize)
 	if windowSize <= 0 {
@@ -176,25 +117,12 @@ func (v *VAD) DetectSpeech(audioSamples []float32, sampleRate int) ([]SpeechSegm
 	return segments, nil
 }
 
-// Close explicitly destroys all owned native detectors.
+// Close marks the VAD as closed.
 func (v *VAD) Close() {
 	v.mu.Lock()
+	defer v.mu.Unlock()
 	if v.closed {
-		v.mu.Unlock()
 		return
 	}
 	v.closed = true
-	all := v.all
-	v.all = nil
-	close(v.detectors)
-	v.mu.Unlock()
-
-	for range v.detectors {
-	}
-
-	for _, det := range all {
-		if det != nil {
-			sherpa.DeleteVoiceActivityDetector(det)
-		}
-	}
 }
