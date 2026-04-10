@@ -38,11 +38,11 @@ const (
 	defaultWorkers                = 4
 	defaultMaxUploadMB            = 32
 	defaultVADThreshold           = 0.5
-	defaultVADMinSilence          = 0.5
+	defaultVADMinSilence          = 0.45
 	defaultVADMinSpeech           = 0.25
 	defaultVADSegmentPadding      = 0.0
-	defaultCalibrationTargetPeak  = 120.0
-	defaultCalibrationMaxGain     = 200.0
+	defaultCalibrationTargetPeak  = 20.0
+	defaultCalibrationMaxGain     = 40.0
 	defaultCalibrationMaxMSamples = 8192
 )
 
