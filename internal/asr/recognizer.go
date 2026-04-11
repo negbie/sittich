@@ -104,7 +104,7 @@ func (r *Recognizer) TranscribeBatch(ctx context.Context, chunks [][]float32, sa
 		}
 
 		// Process audio
-		calibration := r.calibrateAudio(audio)
+		audio, calibration := r.calibrateAudio(audio)
 		if opts.Debug {
 			fmt.Fprintf(
 				os.Stderr,
@@ -225,8 +225,9 @@ type CalibrationStats struct {
 }
 
 // calibrateAudio applies a fixed gain to the audio samples to bring them
-// into the optimal range for the transuder model.
-func (r *Recognizer) calibrateAudio(audio []float32) CalibrationStats {
+// into the optimal range for the transuder model. It returns a new slice
+// if scaling is applied, leaving the original audio untouched.
+func (r *Recognizer) calibrateAudio(audio []float32) ([]float32, CalibrationStats) {
 	stats := CalibrationStats{
 		Scale: 1.0,
 	}
@@ -234,7 +235,7 @@ func (r *Recognizer) calibrateAudio(audio []float32) CalibrationStats {
 	n := len(audio)
 	if n == 0 {
 		stats.Skipped = true
-		return stats
+		return audio, stats
 	}
 
 	scale := float32(20.0)
@@ -244,16 +245,21 @@ func (r *Recognizer) calibrateAudio(audio []float32) CalibrationStats {
 	stats.Scale = scale
 
 	if scale == 1.0 {
-		return stats
+		return audio, stats
 	}
 
+	calibrated := make([]float32, n)
 	for i := 0; i < n; i++ {
 		v := audio[i] * scale
-		if v > 1.0 || v < -1.0 {
+		if v > 1.0 {
 			stats.Clipped++
+			v = 1.0
+		} else if v < -1.0 {
+			stats.Clipped++
+			v = -1.0
 		}
-		audio[i] = v
+		calibrated[i] = v
 	}
 
-	return stats
+	return calibrated, stats
 }

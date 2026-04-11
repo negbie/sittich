@@ -56,8 +56,8 @@ func (p *Pool) Submit(job *Job) error {
 	select {
 	case p.queue <- job:
 		return nil
-	default:
-		return fmt.Errorf("queue full (max %d jobs)", cap(p.queue))
+	case <-time.After(5 * time.Second):
+		return fmt.Errorf("queue full, waited 5s (max %d jobs)", cap(p.queue))
 	}
 }
 
@@ -75,11 +75,16 @@ func (p *Pool) TotalWorkers() int {
 
 func (p *Pool) Shutdown() {
 	p.shutdownOnce.Do(func() {
-		p.cancel()
-		close(p.queue)
-		p.wg.Wait()
+		p.cancel()          // Signal workers to stop
+		close(p.queue)      // Close job queue
+		p.wg.Wait()         // Wait for all workers to finish
 
-		// Explicitly close the shared engine once all workers are done
+		// Additional safety: ensure no workers are busy before closing engine
+		for p.busyCount.Load() > 0 {
+			time.Sleep(10 * time.Millisecond)
+		}
+
+		// Now safe to close the shared engine
 		if p.engine != nil {
 			p.engine.Close()
 		}

@@ -35,7 +35,6 @@ type cliOptions struct {
 	ListenAddr             string
 	ChunkSize              int
 	ChunkOverlapDuration   float64
-	ChunkMinTailDuration   float64
 	Format                 string
 	MaxActivePaths         int
 	DecodingMethod         string
@@ -72,10 +71,7 @@ var allFlags = []cliFlag{
 	{long: "format", arg: "string", description: "default output format: text, json, vtt", defaultVal: config.DefaultFormat},
 	{long: "chunk-size", arg: "int", description: "default chunk size in seconds", defaultVal: strconv.Itoa(config.DefaultChunkSize)},
 	{long: "chunk-overlap", arg: "float", description: "overlap duration between chunks in seconds", defaultVal: strconv.FormatFloat(config.DefaultChunkOverlap, 'f', 1, 64)},
-	{long: "chunk-min-tail", arg: "float", description: "minimum tail duration when balancing oversized chunks in seconds", defaultVal: strconv.FormatFloat(config.DefaultChunkMinTail, 'f', 1, 64)},
 	{long: "debug", description: "show detailed debug logs"},
-	{long: "max-active-paths", arg: "int", description: "number of active paths for modified beam search", defaultVal: strconv.Itoa(config.DefaultMaxActivePaths)},
-	{long: "chunk-min-tail", arg: "float", description: "minimum tail duration when balancing oversized chunks in seconds", defaultVal: strconv.FormatFloat(config.DefaultChunkMinTail, 'f', 1, 64)},
 	{long: "scale", arg: "float", description: "fixed signal scale factor applied to audio", defaultVal: strconv.FormatFloat(config.DefaultFixedScale, 'f', 1, 64)},
 	{long: "data-folder", arg: "path", description: "path to model directory"},
 	{long: "version", description: "show version"},
@@ -129,7 +125,6 @@ func parseCLI(args []string) (cliOptions, error) {
 	format := fs.String("format", config.DefaultFormat, "default output format (text, json, vtt)")
 	chunkSize := fs.Int("chunk-size", config.DefaultChunkSize, "default chunk size in seconds")
 	chunkOverlap := fs.Float64("chunk-overlap", config.DefaultChunkOverlap, "overlap duration between adjacent chunks in seconds")
-	chunkMinTail := fs.Float64("chunk-min-tail", config.DefaultChunkMinTail, "minimum tail duration when balancing oversized chunks in seconds")
 	maxActivePaths := fs.Int("max-active-paths", config.DefaultMaxActivePaths, "number of active paths for modified beam search")
 	decodingMethod := fs.String("decoding-method", config.DefaultDecodingMethod, "decoding method: greedy_search or modified_beam_search")
 	fixedScale := fs.Float64("scale", config.DefaultFixedScale, "fixed signal scale factor applied to audio")
@@ -156,7 +151,6 @@ func parseCLI(args []string) (cliOptions, error) {
 		Format:               strings.ToLower(*format),
 		ChunkSize:            *chunkSize,
 		ChunkOverlapDuration: *chunkOverlap,
-		ChunkMinTailDuration: *chunkMinTail,
 		MaxActivePaths:       *maxActivePaths,
 		DecodingMethod:       strings.ToLower(*decodingMethod),
 		NoVAD:                true,
@@ -178,9 +172,6 @@ func parseCLI(args []string) (cliOptions, error) {
 
 	if opts.MaxActivePaths < 1 {
 		return cliOptions{}, fmt.Errorf("%w: max-active-paths must be >= 1", errInvalidArgs)
-	}
-	if opts.ChunkMinTailDuration < 0 {
-		return cliOptions{}, fmt.Errorf("%w: chunk-min-tail must be >= 0", errInvalidArgs)
 	}
 	if opts.ChunkOverlapDuration < 0 {
 		return cliOptions{}, fmt.Errorf("%w: chunk-overlap must be >= 0", errInvalidArgs)

@@ -8,8 +8,10 @@ import (
 // Chunk represents a slice of audio destined for a single engine inference
 // call. Start and End are in seconds relative to the original audio.
 type Chunk struct {
-	Start float64
-	End   float64
+	Start     float64
+	End       float64
+	OrigStart float64
+	OrigEnd   float64
 }
 
 // ChunkSpeechSegments groups consecutive SpeechSegments into Chunks whose
@@ -17,7 +19,7 @@ type Chunk struct {
 // silence boundaries. If a single speech segment exceeds maxDuration, it
 // is split into smaller balanced sub-segments with overlapDuration.
 // It uses energy-aware splitting for oversized segments if samples are provided.
-func ChunkSpeechSegments(samples []float32, sampleRate int, segments []SpeechSegment, maxDuration float64, overlapDuration float64, minTailDuration float64) []Chunk {
+func ChunkSpeechSegments(samples []float32, sampleRate int, segments []SpeechSegment, maxDuration float64, overlapDuration float64) []Chunk {
 	if len(segments) == 0 {
 		return nil
 	}
@@ -110,8 +112,10 @@ func ChunkSpeechSegments(samples []float32, sampleRate int, segments []SpeechSeg
 			
 			if proposedDuration > maxDuration {
 				chunks = append(chunks, Chunk{
-					Start: chunkStart,
-					End:   chunkEnd,
+					Start:     chunkStart,
+					End:       chunkEnd,
+					OrigStart: chunkStart,
+					OrigEnd:   chunkEnd,
 				})
 				// Start new chunk. To maintain continuity if this was a VAD-based cut,
 				// we could ideally add overlap, but VAD cuts are usually at silence.
@@ -128,8 +132,10 @@ func ChunkSpeechSegments(samples []float32, sampleRate int, segments []SpeechSeg
 
 		if chunkEnd > chunkStart {
 			chunks = append(chunks, Chunk{
-				Start: chunkStart,
-				End:   chunkEnd,
+				Start:     chunkStart,
+				End:       chunkEnd,
+				OrigStart: chunkStart,
+				OrigEnd:   chunkEnd,
 			})
 		}
 	}

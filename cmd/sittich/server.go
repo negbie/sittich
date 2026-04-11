@@ -49,7 +49,6 @@ func runServer(opts *cliOptions) error {
 		config.Pipeline{
 			ChunkDuration:        float64(opts.ChunkSize),
 			ChunkOverlapDuration: opts.ChunkOverlapDuration,
-			ChunkMinTailDuration: opts.ChunkMinTailDuration,
 			WordTimestamps:       true,
 			Debug:                opts.Debug,
 		},

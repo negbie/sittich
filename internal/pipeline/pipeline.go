@@ -75,7 +75,7 @@ func (p *Pipeline) TranscribeFile(ctx context.Context, path string, opts speech.
 		return nil, fmt.Errorf("pipeline: not ready, model is still loading")
 	}
 
-	samples, sampleRate, channels, err := decodeAudioFile(path)
+	samples, sampleRate, channels, err := decodeAudioFile(ctx, path)
 	if err != nil {
 		return nil, fmt.Errorf("pipeline: decode: %w", err)
 	}
@@ -87,7 +87,7 @@ func (p *Pipeline) TranscribeFile(ctx context.Context, path string, opts speech.
 // Process decodes the audio file at audioPath and runs the pipeline.
 // If chunkDuration is > 0, it overrides the pipeline's default setting.
 func (p *Pipeline) Process(ctx context.Context, audioPath string, chunkDuration float64) (*speech.Result, error) {
-	samples, sampleRate, channels, err := decodeAudioFile(audioPath)
+	samples, sampleRate, channels, err := decodeAudioFile(ctx, audioPath)
 	if err != nil {
 		return nil, fmt.Errorf("pipeline: decode: %w", err)
 	}
@@ -121,10 +121,17 @@ func (p *Pipeline) ProcessAudio(ctx context.Context, samples []float32, sampleRa
 }
 
 func (p *Pipeline) processAudioInternal(ctx context.Context, samples []float32, sampleRate int, channels int, opts speech.Options, chunkDuration float64) (*speech.Result, error) {
-	const (
-		targetRate = 16000
-		padding    = 0.30 // 300ms padding for context
-	)
+	const targetRate = 16000
+	overlap := p.config.ChunkOverlapDuration
+	padding := 0.30 // 300ms floor for context
+	if overlap > 0 {
+		// Optimization: Scale context padding with overlap to provide better anchors for the stitcher.
+		if overlap/2 > padding {
+			padding = overlap / 2
+		}
+	} else {
+		padding = 0.0
+	}
 
 	totalStart := time.Now()
 
@@ -134,25 +141,39 @@ func (p *Pipeline) processAudioInternal(ctx context.Context, samples []float32, 
 
 	// 1. Tiling & Chunking
 	totalDur := float64(len(resampled)) / float64(targetRate)
-	var segments []SpeechSegment
-	for start := 0.0; start < totalDur; start += chunkDuration {
-		end := start + chunkDuration
-		if end > totalDur {
-			end = totalDur
-		}
-		segments = append(segments, SpeechSegment{Start: start, End: end})
+	var chunks []Chunk
+	step := chunkDuration - overlap
+	if step <= 0 {
+		step = chunkDuration
 	}
 
-	// Expand segments into chunks with context padding
-	chunks := ChunkSpeechSegments(resampled, targetRate, segments, chunkDuration, p.config.ChunkOverlapDuration, p.config.ChunkMinTailDuration)
-	for i := range chunks {
-		chunks[i].Start -= padding
-		if chunks[i].Start < 0 {
-			chunks[i].Start = 0
+	for start := 0.0; start < totalDur; {
+		origStart := start
+		origEnd := start + chunkDuration
+		if origEnd > totalDur {
+			origEnd = totalDur
 		}
-		chunks[i].End += padding
-		if chunks[i].End > totalDur {
-			chunks[i].End = totalDur
+
+		chunkStart := origStart - padding
+		if chunkStart < 0 {
+			chunkStart = 0
+		}
+		chunkEnd := origEnd + padding
+		if chunkEnd > totalDur {
+			chunkEnd = totalDur
+		}
+
+		chunks = append(chunks, Chunk{
+			Start:     chunkStart,
+			End:       chunkEnd,
+			OrigStart: origStart,
+			OrigEnd:   origEnd,
+		})
+
+		if overlap >= chunkDuration || origEnd >= totalDur {
+			start = origEnd
+		} else {
+			start += step
 		}
 	}
 
@@ -230,10 +251,10 @@ func (p *Pipeline) transcribeChunks(ctx context.Context, resampled []float32, ta
 			continue
 		}
 
-		chunkAudio := resampled[startSample:endSample]
-		if len(chunkAudio) == 0 {
-			continue
-		}
+		// Bug #1: Copy the chunk audio instead of slicing to avoid in-place
+		// calibration corrupting shared memory.
+		chunkAudio := make([]float32, endSample-startSample)
+		copy(chunkAudio, resampled[startSample:endSample])
 
 		batch = append(batch, chunkAudio)
 		offsets = append(offsets, c.Start)
@@ -255,8 +276,10 @@ func (p *Pipeline) transcribeChunks(ctx context.Context, resampled []float32, ta
 	chunkResults := make([]ChunkResult, len(results))
 	for i, res := range results {
 		chunkResults[i] = ChunkResult{
-			Offset: offsets[i],
-			Result: res,
+			Offset:    offsets[i],
+			OrigStart: chunks[i].OrigStart,
+			OrigEnd:   chunks[i].OrigEnd,
+			Result:    res,
 		}
 	}
 
@@ -277,14 +300,14 @@ func (p *Pipeline) mergeOptions(opts speech.Options) speech.Options {
 	return opts
 }
 
-func decodeAudioFile(path string) ([]float32, int, int, error) {
+func decodeAudioFile(ctx context.Context, path string) ([]float32, int, int, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, 0, 0, err
 	}
 	defer f.Close()
 
-	samples, err := audio.DecodeWAV(f)
+	samples, err := audio.DecodeWAV(ctx, f)
 	if err != nil {
 		return nil, 0, 0, err
 	}

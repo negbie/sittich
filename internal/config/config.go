@@ -4,11 +4,10 @@ package config
 const (
 	DefaultListenAddr     = ":5092"
 	DefaultChunkSize      = 40
-	DefaultChunkOverlap   = 1.0
-	DefaultChunkMinTail   = 1.5
+	DefaultChunkOverlap   = 0.4
 	DefaultFormat         = "text"
-	DefaultMaxActivePaths = 2
-	DefaultDecodingMethod = "greedy_search"
+	DefaultMaxActivePaths = 3
+	DefaultDecodingMethod = "modified_beam_search"
 	DefaultWorkers        = 4
 	DefaultMaxUploadMB    = 32
 	DefaultFixedScale     = 1.5
@@ -45,10 +44,6 @@ type Pipeline struct {
 	// ChunkOverlapDuration is the duration in seconds of overlap between
 	// adjacent chunks to ensure continuity at boundaries.
 	ChunkOverlapDuration float64
-
-	// ChunkMinTailDuration is the minimum tail duration used when balancing
-	// oversized speech segments into smaller chunks.
-	ChunkMinTailDuration float64
 
 	// WordTimestamps requests word-level timing from the engine.
 	WordTimestamps bool

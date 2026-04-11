@@ -170,9 +170,14 @@ func (d *Dispatcher) worker(id int) {
 		// Second, if we still have room, wait for a short window
 		if len(batch) < d.batchSize {
 			timer := time.NewTimer(d.window)
+			defer timer.Stop() // Ensure timer cleanup on all exit paths
+
 		BatchLoop:
 			for len(batch) < d.batchSize {
 				select {
+				case <-d.ctx.Done():
+					// Context cancelled, exit immediately
+					return
 				case nextJob, ok := <-d.jobChan:
 					if !ok {
 						break BatchLoop
@@ -182,7 +187,7 @@ func (d *Dispatcher) worker(id int) {
 					break BatchLoop
 				}
 			}
-			timer.Stop()
+			// timer.Stop() called by defer
 		}
 
 		// 3. Execute Batch

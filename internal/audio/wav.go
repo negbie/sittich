@@ -4,69 +4,177 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"os"
-	"os/exec"
+	"log/slog"
+	"math"
 )
 
-// DecodeWAV decodes any audio file by shelling out to 'sox'. It streams the
-// output directly into a float32 slice to minimize memory allocations.
-func DecodeWAV(r io.Reader) ([]float32, error) {
-	// 1. Probe the file length if it's a file on disk to pre-allocate memory
-	var initialCapacity int
-	if f, ok := r.(*os.File); ok {
-		if st, err := f.Stat(); err == nil && st.Size() > 0 {
-			// Rough estimate: raw 16kHz Mono is ~32KB/sec.
-			// Input file size is a good upper bound for capacity.
-			initialCapacity = int(st.Size() / 2)
-		}
-	}
-	if initialCapacity < 1024*1024 {
-		initialCapacity = 1024 * 1024 // Default to 1min of audio
-	}
-
-	args := []string{
-		"-",
-		"-t", "raw", "-r", "16000", "-c", "1", "-e", "signed-integer", "-b", "16", "-",
-	}
-
-	cmd := exec.Command("sox", args...)
-	cmd.Stdin = r
-	stdout, err := cmd.StdoutPipe()
+// DecodeNative parses a WAV file from an io.Reader and returns float32 samples normalized to [-1, 1].
+// It handles standard PCM (16/24/32-bit) and IEEE Float (32-bit).
+func DecodeNative(r io.Reader) ([]float32, error) {
+	data, err := io.ReadAll(r)
 	if err != nil {
-		return nil, fmt.Errorf("audio: stdout pipe: %w", err)
+		return nil, fmt.Errorf("read wav: %w", err)
 	}
-	defer stdout.Close()
+	return parseWAV(data)
+}
 
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("audio: failed to start sox: %w", err)
+// parseWAV parses a WAV file from a byte slice.
+func parseWAV(data []byte) ([]float32, error) {
+	if len(data) < 44 {
+		return nil, fmt.Errorf("WAV file too small")
 	}
 
-	samples := make([]float32, 0, initialCapacity)
-	buf := make([]byte, 32*1024)
+	// Check RIFF header
+	if string(data[0:4]) != "RIFF" {
+		return nil, fmt.Errorf("not a RIFF file")
+	}
+	if string(data[8:12]) != "WAVE" {
+		return nil, fmt.Errorf("not a WAVE file")
+	}
 
-	for {
-		n, err := io.ReadFull(stdout, buf)
-		if n > 0 {
-			// Convert every 2 bytes (int16) to a float32
-			for i := 0; i < n; i += 2 {
-				v := int16(binary.LittleEndian.Uint16(buf[i:]))
-				samples = append(samples, float32(v)/32768.0)
+	// Find fmt chunk
+	offset := 12
+	var audioFormat, numChannels uint16
+	var sampleRate, byteRate uint32
+	var blockAlign, bitsPerSample uint16
+
+	for offset < len(data)-8 {
+		chunkID := string(data[offset : offset+4])
+		chunkSize := binary.LittleEndian.Uint32(data[offset+4 : offset+8])
+
+		if chunkID == "fmt " {
+			if chunkSize < 16 {
+				return nil, fmt.Errorf("fmt chunk too small")
 			}
+			audioFormat = binary.LittleEndian.Uint16(data[offset+8 : offset+10])
+			numChannels = binary.LittleEndian.Uint16(data[offset+10 : offset+12])
+			sampleRate = binary.LittleEndian.Uint32(data[offset+12 : offset+16])
+			byteRate = binary.LittleEndian.Uint32(data[offset+16 : offset+20])
+			blockAlign = binary.LittleEndian.Uint16(data[offset+20 : offset+22])
+			bitsPerSample = binary.LittleEndian.Uint16(data[offset+22 : offset+24])
+			_ = byteRate   // unused
+			_ = blockAlign // unused
+		} else if chunkID == "data" {
+			dataStart := offset + 8
+			dataEnd := dataStart + int(chunkSize)
+			if dataEnd > len(data) {
+				dataEnd = len(data)
+			}
+			audioData := data[dataStart:dataEnd]
+
+			slog.Debug("WAV parsed",
+				"format", audioFormat,
+				"channels", numChannels,
+				"sampleRate", sampleRate,
+				"bitsPerSample", bitsPerSample,
+				"dataSize", len(audioData),
+			)
+
+			// Convert to float32
+			samples, err := convertToFloat32(audioData, audioFormat, numChannels, bitsPerSample)
+			if err != nil {
+				return nil, err
+			}
+
+			// Resample to 16kHz if needed
+			if sampleRate != 16000 {
+				slog.Debug("resampling",
+					"from", sampleRate,
+					"to", 16000,
+					"samplesIn", len(samples),
+					"samplesOut", int(float64(len(samples))*16000.0/float64(sampleRate)),
+				)
+				samples = resample(samples, int(sampleRate), 16000)
+			}
+
+			return samples, nil
 		}
-		if err == io.EOF || err == io.ErrUnexpectedEOF {
-			break
-		}
-		if err != nil {
-			return nil, fmt.Errorf("audio: read sox pipe: %w", err)
+
+		offset += 8 + int(chunkSize)
+		if chunkSize%2 != 0 {
+			offset++ // Padding byte
 		}
 	}
 
-	if err := cmd.Wait(); err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			return nil, fmt.Errorf("sox error: %s", string(exitErr.Stderr))
+	return nil, fmt.Errorf("no data chunk found")
+}
+
+func convertToFloat32(data []byte, audioFormat, numChannels, bitsPerSample uint16) ([]float32, error) {
+	if audioFormat != 1 && audioFormat != 3 {
+		return nil, fmt.Errorf("unsupported audio format: %d (only PCM supported)", audioFormat)
+	}
+
+	bytesPerSample := int(bitsPerSample / 8)
+	numSamples := len(data) / (bytesPerSample * int(numChannels))
+	samples := make([]float32, numSamples)
+
+	for i := 0; i < numSamples; i++ {
+		var sum float64
+		for ch := 0; ch < int(numChannels); ch++ {
+			offset := (i*int(numChannels) + ch) * bytesPerSample
+			if offset+bytesPerSample > len(data) {
+				break
+			}
+
+			var val float64
+			switch bitsPerSample {
+			case 8:
+				// Unsigned 8-bit
+				val = float64(data[offset])/128.0 - 1.0
+			case 16:
+				// Signed 16-bit little endian
+				sample := int16(binary.LittleEndian.Uint16(data[offset : offset+2]))
+				val = float64(sample) / 32768.0
+			case 24:
+				// Signed 24-bit little endian
+				b := data[offset : offset+3]
+				sample := int32(b[0]) | int32(b[1])<<8 | int32(b[2])<<16
+				if sample&0x800000 != 0 {
+					sample |= ^0xffffff // Sign extend
+				}
+				val = float64(sample) / 8388608.0
+			case 32:
+				if audioFormat == 3 {
+					// Float 32-bit
+					bits := binary.LittleEndian.Uint32(data[offset : offset+4])
+					val = float64(math.Float32frombits(bits))
+				} else {
+					// Signed 32-bit
+					sample := int32(binary.LittleEndian.Uint32(data[offset : offset+4]))
+					val = float64(sample) / 2147483648.0
+				}
+			default:
+				return nil, fmt.Errorf("unsupported bits per sample: %d", bitsPerSample)
+			}
+			sum += val
 		}
-		return nil, fmt.Errorf("sox wait: %w", err)
+		// Average channels (convert stereo to mono)
+		samples[i] = float32(sum / float64(numChannels))
 	}
 
 	return samples, nil
+}
+
+// resample uses linear interpolation for simple resampling
+func resample(samples []float32, srcRate, dstRate int) []float32 {
+	if srcRate == dstRate {
+		return samples
+	}
+
+	ratio := float64(srcRate) / float64(dstRate)
+	newLen := int(float64(len(samples)) / ratio)
+	result := make([]float32, newLen)
+
+	for i := 0; i < newLen; i++ {
+		srcIdx := float64(i) * ratio
+		lo := int(srcIdx)
+		hi := lo + 1
+		if hi >= len(samples) {
+			hi = len(samples) - 1
+		}
+		frac := float32(srcIdx - float64(lo))
+		result[i] = samples[lo]*(1-frac) + samples[hi]*frac
+	}
+
+	return result
 }

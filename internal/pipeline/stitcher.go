@@ -1,6 +1,8 @@
 package pipeline
 
 import (
+	"fmt"
+	"os"
 	"strings"
 
 	"github.com/negbie/sittich/internal/speech"
@@ -9,8 +11,10 @@ import (
 // ChunkResult pairs an engine transcription result with the time offset (in
 // seconds) of the chunk relative to the original audio.
 type ChunkResult struct {
-	Offset float64       // Start time of this chunk in the original audio.
-	Result *speech.Result // Transcription result for the chunk.
+	Offset    float64        // Start time of this chunk in the original audio (including padding).
+	OrigStart float64        // Original start time before padding.
+	OrigEnd   float64        // Original end time before padding.
+	Result    *speech.Result // Transcription result for the chunk.
 }
 
 // StitchResults merges multiple ChunkResults into a single speech.Result by
@@ -62,6 +66,23 @@ func StitchResults(chunks []ChunkResult) *speech.Result {
 			chunkWords = append(chunkWords, seg.Words...)
 		}
 
+		// Bug #3: Trim words whose midpoint falls outside [OrigStart, OrigEnd]
+		// The padding region is for context only; its transcription shouldn't leak.
+		if cr.OrigEnd > cr.OrigStart {
+			filtered := make([]speech.Word, 0, len(chunkWords))
+			for _, w := range chunkWords {
+				mid := w.Start + (w.End-w.Start)/2
+				if mid >= cr.OrigStart && mid <= cr.OrigEnd {
+					filtered = append(filtered, w)
+				}
+			}
+			chunkWords = filtered
+		}
+
+		if len(chunkWords) == 0 {
+			continue
+		}
+
 		if i == 0 {
 			allWords = append(allWords, chunkWords...)
 			continue
@@ -79,7 +100,9 @@ func StitchResults(chunks []ChunkResult) *speech.Result {
 		overlapStart := chunkWords[0].Start
 
 		if overlapStart >= lastTokenGlobalEnd {
-			// No temporal overlap, just append
+			// No temporal overlap, just append. This is the expected fast-path
+			// when using a deterministic native decoder + sequential chunks.
+			fmt.Fprintf(os.Stderr, "   [Stitcher] Stage simple_append offset=%.2f\n", cr.Offset)
 			allWords = append(allWords, chunkWords...)
 			continue
 		}
@@ -111,8 +134,26 @@ func StitchResults(chunks []ChunkResult) *speech.Result {
 
 		lcsIndices := findLCS(aTexts, bTexts)
 		if len(lcsIndices) == 0 {
-			// No LCS found, just append (risky but fallback)
-			allWords = append(allWords, chunkWords...)
+			// Bug #3 fallback: No LCS found, use temporal overlap to find a cut point.
+			// We split at the midpoint of the temporal overlap between existing results
+			// and the new chunk.
+			cutPoint := (overlapStart + lastTokenGlobalEnd) / 2
+
+			// Trim allWords to cutPoint
+			newAllWords := make([]speech.Word, 0, len(allWords))
+			for _, w := range allWords {
+				if (w.Start + (w.End-w.Start)/2) < cutPoint {
+					newAllWords = append(newAllWords, w)
+				}
+			}
+			allWords = newAllWords
+
+			// Append chunkWords starting from cutPoint
+			for _, w := range chunkWords {
+				if (w.Start + (w.End-w.Start)/2) >= cutPoint {
+					allWords = append(allWords, w)
+				}
+			}
 			continue
 		}
 
@@ -122,8 +163,7 @@ func StitchResults(chunks []ChunkResult) *speech.Result {
 		idxB := lcsIndices[midLCS].j
 
 		// Keep allWords up to idxA (exclusive) and chunkWords from idxB (exclusive)
-		// Wait, if it's the middle of LCS, we should keep the LCS token from one of them.
-		// Let's keep it from allWords.
+		// Let's keep the LCS token from allWords.
 		allWords = allWords[:idxA+1]
 		if idxB+1 < len(chunkWords) {
 			allWords = append(allWords, chunkWords[idxB+1:]...)
