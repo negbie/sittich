@@ -2,31 +2,10 @@ package server
 
 import (
 	"context"
-	"time"
 
-	"github.com/negbie/sittich/internal/types"
+	"github.com/negbie/sittich/internal/speech"
+	"github.com/negbie/sittich/internal/worker"
 )
-
-// Job represents a transcription job
-type Job struct {
-	ID        string
-	FilePath  string
-	Format    string
-	ChunkSize int
-	Result    chan JobResult
-	Error     chan error
-	StartTime time.Time
-	Ctx       context.Context
-}
-
-// JobResult holds the result of a transcription job
-type JobResult struct {
-	Duration       float64
-	ProcessingTime float64
-	RealtimeFactor float64
-	Text           string
-	Segments       []types.Segment
-}
 
 // TranscribeRequest represents a transcription request
 type TranscribeRequest struct {
@@ -44,7 +23,7 @@ type TranscribeResponse struct {
 	ProcessingTime float64         `json:"processing_time_seconds"`
 	RealtimeFactor float64         `json:"realtime_factor"`
 	Text           string          `json:"text"`
-	Segments       []types.Segment `json:"segments,omitempty"`
+	Segments       []speech.Segment `json:"segments,omitempty"`
 }
 
 // HealthResponse represents a health check response
@@ -58,28 +37,9 @@ type HealthResponse struct {
 	BusyWorkers int    `json:"busy_workers"`
 }
 
-// ServerOptions holds server configuration
-type ServerOptions struct {
-	ListenAddr   string
-	MaxUploadMB  int64
-	Workers      int
-	MaxQueueSize int
-	Debug        bool
-}
-
-// DefaultServerOptions returns default server options
-func DefaultServerOptions() *ServerOptions {
-	return &ServerOptions{
-		ListenAddr:   ":8080",
-		MaxUploadMB:  1024,
-		Workers:      2,
-		MaxQueueSize: 10,
-	}
-}
-
 // RecognizerPool is the interface for the worker pool
 type RecognizerPool interface {
-	Submit(job *Job) error
+	Submit(job *worker.Job) error
 	QueueSize() int
 	BusyWorkers() int
 	TotalWorkers() int
@@ -88,6 +48,6 @@ type RecognizerPool interface {
 
 // Recognizer is the interface for ASR recognizer
 type Recognizer interface {
-	Transcribe(ctx context.Context, audio []float32, sampleRate int, opts types.Options) (*types.Result, error)
+	Transcribe(ctx context.Context, audio []float32, sampleRate int, opts speech.Options) (*speech.Result, error)
 	Close() error
 }

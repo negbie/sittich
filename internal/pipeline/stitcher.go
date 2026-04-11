@@ -1,21 +1,21 @@
 package pipeline
 
 import (
-	"github.com/negbie/sittich/internal/types"
+	"github.com/negbie/sittich/internal/speech"
 )
 
 // ChunkResult pairs an engine transcription result with the time offset (in
 // seconds) of the chunk relative to the original audio.
 type ChunkResult struct {
 	Offset float64       // Start time of this chunk in the original audio.
-	Result *types.Result // Transcription result for the chunk.
+	Result *speech.Result // Transcription result for the chunk.
 }
 
-// StitchResults merges multiple ChunkResults into a single types.Result by
+// StitchResults merges multiple ChunkResults into a single speech.Result by
 // offsetting chunk-relative timestamps into the original audio timeline and
 // appending segments in order.
-func StitchResults(chunks []ChunkResult) *types.Result {
-	combined := &types.Result{}
+func StitchResults(chunks []ChunkResult) *speech.Result {
+	combined := &speech.Result{}
 
 	if len(chunks) == 0 {
 		return combined
@@ -35,18 +35,18 @@ func StitchResults(chunks []ChunkResult) *types.Result {
 		}
 
 		for _, seg := range cr.Result.Segments {
-			shifted := types.Segment{
+			shifted := speech.Segment{
 				ID:           segID,
 				Start:        seg.Start + cr.Offset,
 				End:          seg.End + cr.Offset,
 				Text:         seg.Text,
 				AvgLogProb:   seg.AvgLogProb,
 				NoSpeechProb: seg.NoSpeechProb,
-				Words:        make([]types.Word, len(seg.Words)),
+				Words:        make([]speech.Word, len(seg.Words)),
 			}
 
 			for j, w := range seg.Words {
-				shifted.Words[j] = types.Word{
+				shifted.Words[j] = speech.Word{
 					Word:  w.Word,
 					Start: w.Start + cr.Offset,
 					End:   w.End + cr.Offset,

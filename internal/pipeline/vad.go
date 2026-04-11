@@ -24,7 +24,7 @@ type SpeechSegment struct {
 }
 
 // NewVAD creates a VAD configuration wrapper and initializes detector ownership.
-func NewVAD(modelPath string, threshold, minSilenceDuration, minSpeechDuration float32) (*VAD, error) {
+func NewVAD(modelPath string, threshold, minSilenceDuration, minSpeechDuration float32, numThreads int) (*VAD, error) {
 	config := sherpa.VadModelConfig{
 		SileroVad: sherpa.SileroVadModelConfig{
 			Model:              modelPath,
@@ -34,7 +34,7 @@ func NewVAD(modelPath string, threshold, minSilenceDuration, minSpeechDuration f
 			WindowSize:         512,
 		},
 		SampleRate: 16000,
-		NumThreads: 1,
+		NumThreads: numThreads,
 		Debug:      0,
 		Provider:   "cpu",
 	}

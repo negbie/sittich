@@ -1,0 +1,79 @@
+#!/bin/sh
+
+# Environment variables:
+#   API_URL   - transcription endpoint, e.g. http://localhost:5092/transcribe
+#   API_OPTS  - optional extra curl form fields, e.g. -F chunk_size=45 -F format=text
+#   CURL_OPTS - optional extra curl flags
+#
+# This script expects voicemail emails with a single WAV attachment and sends the
+# decoded WAV to the local sittich HTTP API using multipart upload:
+#   curl -X POST "$API_URL" -F file=@stream.part3.wav
+
+set -eu
+
+API_URL="${API_URL:-http://localhost:5092/transcribe}"
+API_OPTS="${API_OPTS:-}"
+CURL_OPTS="${CURL_OPTS:-}"
+
+ORIG_PWD=$(pwd)
+TMPDIR=$(mktemp -d)
+
+cleanup() {
+	cd "$ORIG_PWD" 2>/dev/null || true
+	rm -rf "$TMPDIR"
+}
+trap cleanup EXIT INT TERM
+
+cd "$TMPDIR"
+
+cat > stream.org
+
+BOUNDARY=$(grep -im1 'boundary=' stream.org | sed 's/.*boundary="\{0,1\}\([^";[:space:]]*\).*/\1/')
+
+if [ -z "$BOUNDARY" ]; then
+	mv stream.org stream.new
+else
+	awk '/'"$BOUNDARY"'/{i++}{print > "stream.part"i}' stream.org
+
+	if [ ! -f stream.part3 ]; then
+		mv stream.org stream.new
+	else
+		sed '7,$d' stream.part3 > stream.part3.wav.head
+		sed '1,6d' stream.part3 > stream.part3.wav.base64
+
+		tr -d '\r' < stream.part3.wav.base64 > stream.part3.wav.base64.tmp
+		mv stream.part3.wav.base64.tmp stream.part3.wav.base64
+
+		base64 -di stream.part3.wav.base64 > stream.part3.wav
+
+		TRANSCRIPT=""
+		if [ -s stream.part3.wav ]; then
+			if RESPONSE=$(sh -c "curl -sS $CURL_OPTS -X POST \"$API_URL\" -F file=@stream.part3.wav $API_OPTS" 2>curl.err); then
+				TRANSCRIPT=$(printf '%s' "$RESPONSE")
+			else
+				ERRMSG=$(cat curl.err 2>/dev/null || true)
+				TRANSCRIPT="[transcription failed: ${ERRMSG:-curl request failed}]"
+			fi
+		else
+			TRANSCRIPT="[transcription failed: decoded WAV attachment is empty]"
+		fi
+
+		mv stream.part stream.new
+		cat stream.part1 >> stream.new
+		sed '$d' < stream.part2 >> stream.new
+
+		echo "--- Automated transcription result ---" >> stream.new
+		echo "$TRANSCRIPT" >> stream.new
+
+		tail -1 stream.part2 >> stream.new
+		cat stream.part3 >> stream.new
+
+		printf '\n\n' > stream.tmp
+		cat stream.part4 >> stream.tmp
+		tr -d '\r' < stream.tmp > stream.tmp.clean
+		mv stream.tmp.clean stream.tmp
+		cat stream.tmp >> stream.new
+	fi
+fi
+
+sendmail -t < stream.new

@@ -15,31 +15,29 @@ import (
 	"time"
 
 	"github.com/negbie/sittich/internal/asr"
+	"github.com/negbie/sittich/internal/config"
 	"github.com/negbie/sittich/internal/models"
 	"github.com/negbie/sittich/internal/output"
-	"github.com/negbie/sittich/internal/types"
+	"github.com/negbie/sittich/internal/speech"
+	"github.com/negbie/sittich/internal/worker"
 )
 
 // Server is the HTTP server
 type Server struct {
-	httpServer       *http.Server
-	pool             RecognizerPool
-	options          *ServerOptions
-	version          string
-	startTime        time.Time
-	defaultFormat    string
-	defaultChunkSize int
+	httpServer *http.Server
+	pool       RecognizerPool
+	options    *config.Server
+	version    string
+	startTime  time.Time
 }
 
 // NewServer creates a new HTTP server
-func NewServer(options *ServerOptions, pool RecognizerPool, version string) *Server {
+func NewServer(options *config.Server, pool RecognizerPool, version string) *Server {
 	s := &Server{
-		pool:             pool,
-		options:          options,
-		version:          version,
-		startTime:        time.Now(),
-		defaultFormat:    "text",
-		defaultChunkSize: 60,
+		pool:      pool,
+		options:   options,
+		version:   version,
+		startTime: time.Now(),
 	}
 
 	mux := http.NewServeMux()
@@ -58,10 +56,10 @@ func NewServer(options *ServerOptions, pool RecognizerPool, version string) *Ser
 // a request does not explicitly provide them.
 func (s *Server) SetDefaults(format string, chunkSize int) {
 	if format != "" {
-		s.defaultFormat = strings.ToLower(format)
+		s.options.DefaultFormat = strings.ToLower(format)
 	}
 	if chunkSize > 0 {
-		s.defaultChunkSize = chunkSize
+		s.options.DefaultChunkSize = chunkSize
 	}
 }
 
@@ -113,12 +111,12 @@ func (s *Server) handleTranscribe(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(os.Stderr, "[HTTP] parse_request=%s format=%s chunk_size=%d\n", time.Since(requestStart).Round(time.Millisecond), format, chunkSize)
 	}
 
-	job := &Job{
+	job := &worker.Job{
 		ID:        strconv.FormatInt(time.Now().UnixNano(), 10),
 		FilePath:  filePath,
 		Format:    format,
 		ChunkSize: chunkSize,
-		Result:    make(chan JobResult, 1),
+		Result:    make(chan worker.JobResult, 1),
 		Error:     make(chan error, 1),
 		StartTime: time.Now(),
 		Ctx:       ctx,
@@ -178,13 +176,13 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) parseRequest(r *http.Request) (filePath, format string, chunkSize int, cleanup func(), err error) {
-	format = s.defaultFormat
+	format = s.options.DefaultFormat
 	if format == "" {
-		format = "text"
+		format = config.DefaultFormat
 	}
-	chunkSize = s.defaultChunkSize
+	chunkSize = s.options.DefaultChunkSize
 	if chunkSize <= 0 {
-		chunkSize = 60
+		chunkSize = config.DefaultChunkSize
 	}
 
 	contentType := r.Header.Get("Content-Type")
@@ -347,9 +345,9 @@ func (s *Server) sendError(w http.ResponseWriter, status int, message string) {
 	})
 }
 
-func (s *Server) sendFormattedResponse(w http.ResponseWriter, format string, jr JobResult) {
-	// Create a types.Result from JobResult for the output package
-	result := &types.Result{
+func (s *Server) sendFormattedResponse(w http.ResponseWriter, format string, jr worker.JobResult) {
+	// Create a speech.Result from JobResult for the output package
+	result := &speech.Result{
 		Duration: jr.Duration,
 		Segments: jr.Segments,
 	}
@@ -375,14 +373,14 @@ func (s *Server) sendFormattedResponse(w http.ResponseWriter, format string, jr 
 	}
 }
 
-func LoadRecognizer(cfg *asr.Config) (*asr.Recognizer, error) {
+func LoadRecognizer(cfg *config.ASR) (*asr.Recognizer, error) {
 	modelPath, err := models.GetModelPath(cfg.ModelPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get model: %w", err)
 	}
 
 	if cfg == nil {
-		cfg = &asr.Config{
+		cfg = &config.ASR{
 			ModelPath: modelPath,
 		}
 	} else {

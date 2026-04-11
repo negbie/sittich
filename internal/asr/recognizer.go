@@ -6,18 +6,18 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"runtime"
 	"strings"
 	"sync"
 
 	sherpa "github.com/k2-fsa/sherpa-onnx-go/sherpa_onnx"
+	"github.com/negbie/sittich/internal/config"
 	"github.com/negbie/sittich/internal/models"
-	"github.com/negbie/sittich/internal/types"
+	"github.com/negbie/sittich/internal/speech"
 )
 
 // Recognizer wraps Sherpa-ONNX recognizer with thread-safe access and proper cleanup.
 type Recognizer struct {
-	Config     *Config
+	Config     *config.ASR
 	recognizer *sherpa.OfflineRecognizer
 	mu         sync.Mutex
 	cond       *sync.Cond
@@ -26,7 +26,7 @@ type Recognizer struct {
 }
 
 // NewRecognizer creates a new ASR recognizer
-func NewRecognizer(cfg *Config) (*Recognizer, error) {
+func NewRecognizer(cfg *config.ASR) (*Recognizer, error) {
 	sherpaConfig := sherpa.OfflineRecognizerConfig{
 		FeatConfig: sherpa.FeatureConfig{
 			SampleRate: 16000,
@@ -44,23 +44,10 @@ func NewRecognizer(cfg *Config) (*Recognizer, error) {
 		},
 		DecodingMethod: cfg.DecodingMethod,
 		MaxActivePaths: cfg.MaxActivePaths,
-		// Mandatory for INT8 German calibration: fix phonetic drift and silence bias.
-		BlankPenalty: 1.2,
+		BlankPenalty:   0.0,
 	}
 
-	// If NumThreads is 0, we auto-detect based on available cores and worker count.
-	// This prevents the "over-subscription" issue during concurrent transcription.
-	if cfg.NumThreads <= 0 {
-		availableCores := runtime.NumCPU()
-		// If we don't know the worker count, we default to a conservative 1/4 of cores.
-		// However, cfg should ideally handle this.
-		sherpaConfig.ModelConfig.NumThreads = availableCores / 4
-		if sherpaConfig.ModelConfig.NumThreads < 1 {
-			sherpaConfig.ModelConfig.NumThreads = 1
-		}
-	} else {
-		sherpaConfig.ModelConfig.NumThreads = 4
-	}
+	sherpaConfig.ModelConfig.NumThreads = cfg.NumThreads
 
 	recognizer := sherpa.NewOfflineRecognizer(&sherpaConfig)
 	if recognizer == nil {
@@ -79,7 +66,7 @@ func NewRecognizer(cfg *Config) (*Recognizer, error) {
 // Transcribe handles raw PCM samples for the pipeline. It is thread-safe and
 // allows concurrent Decode calls on independent streams while preventing Close
 // from freeing the recognizer during in-flight work.
-func (r *Recognizer) Transcribe(ctx context.Context, audio []float32, sampleRate int, opts types.Options) (*types.Result, error) {
+func (r *Recognizer) Transcribe(ctx context.Context, audio []float32, sampleRate int, opts speech.Options) (*speech.Result, error) {
 	if r == nil {
 		return nil, fmt.Errorf("recognizer is nil")
 	}
@@ -139,7 +126,7 @@ func (r *Recognizer) Transcribe(ctx context.Context, audio []float32, sampleRate
 		if opts.Debug {
 			fmt.Fprintf(os.Stderr, "   [Recognizer] empty_result=nil sample_rate=%d samples=%d\n", sampleRate, len(audio))
 		}
-		return &types.Result{}, nil
+		return &speech.Result{}, nil
 	}
 	if opts.Debug {
 		textLen := len(strings.TrimSpace(sherpaResult.Text))
@@ -150,11 +137,11 @@ func (r *Recognizer) Transcribe(ctx context.Context, audio []float32, sampleRate
 	}
 
 	// Convert to internal types
-	result := &types.Result{
+	result := &speech.Result{
 		Duration: float64(len(audio)) / float64(sampleRate),
 	}
 
-	result.Segments = []types.Segment{
+	result.Segments = []speech.Segment{
 		{
 			ID:    0,
 			Start: 0,
@@ -165,10 +152,10 @@ func (r *Recognizer) Transcribe(ctx context.Context, audio []float32, sampleRate
 
 	// Map timestamps if available
 	if len(sherpaResult.Timestamps) > 0 {
-		result.Segments[0].Words = make([]types.Word, len(sherpaResult.Tokens))
+		result.Segments[0].Words = make([]speech.Word, len(sherpaResult.Tokens))
 		for i, token := range sherpaResult.Tokens {
 			if i < len(sherpaResult.Timestamps) {
-				result.Segments[0].Words[i] = types.Word{
+				result.Segments[0].Words[i] = speech.Word{
 					Word:  token,
 					Start: float64(sherpaResult.Timestamps[i]),
 					End:   float64(sherpaResult.Timestamps[i]) + 0.1,
@@ -318,7 +305,7 @@ func (r *Recognizer) calibrateAudio(audio []float32) calibrationStats {
 	}
 	stats.Scale = scale
 	stats.Skipped = false
-	stats.SkipReason = ""
+	stats.SkipReason = "none"
 
 	for i, v := range audio {
 		nv := v * scale

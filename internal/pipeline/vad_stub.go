@@ -14,7 +14,7 @@ type SpeechSegment struct {
 type VAD struct{}
 
 // NewVAD returns an error indicating that VAD requires a CGo build.
-func NewVAD(_ string, _, _, _ float32) (*VAD, error) {
+func NewVAD(_ string, _, _, _ float32, _ int) (*VAD, error) {
 	return nil, fmt.Errorf("vad: not available (built without CGo)")
 }
 

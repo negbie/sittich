@@ -3,17 +3,10 @@ package output
 import (
 	"io"
 
-	"github.com/negbie/sittich/internal/types"
+	"github.com/negbie/sittich/internal/speech"
 )
 
-// Write writes formatted output to the given writer.
-func Write(out io.Writer, format string, result *types.Result) error {
-	switch format {
-	case "json":
-		return WriteJSON(out, result)
-	case "vtt":
-		return WriteVTT(out, result)
-	default:
-		return WriteText(out, result)
-	}
+// Writer is the interface for different output formats
+type Writer interface {
+	Write(out io.Writer, result *speech.Result) error
 }

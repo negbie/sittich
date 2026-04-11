@@ -12,66 +12,21 @@ import (
 	"time"
 
 	"github.com/negbie/sittich/internal/audio"
-	"github.com/negbie/sittich/internal/types"
+	"github.com/negbie/sittich/internal/config"
+	"github.com/negbie/sittich/internal/speech"
 )
-
-// PipelineConfig controls pipeline behaviour.
-type PipelineConfig struct {
-	// VADEnabled enables Silero VAD-based speech segmentation before
-	// transcription. When false, audio is chunked at fixed intervals.
-	VADEnabled bool
-
-	// ChunkDuration is the maximum duration in seconds per chunk sent to the
-	// engine. Callers are expected to provide this explicitly.
-	ChunkDuration float64
-
-	// ChunkMinTailDuration is the minimum tail duration used when balancing
-	// oversized speech segments into smaller chunks.
-	ChunkMinTailDuration float64
-
-	// VADThreshold controls the speech probability threshold used by VAD.
-	// If <= 0, the VAD implementation default is used.
-	VADThreshold float32
-
-	// VADMinSilenceDuration is the minimum silence duration in seconds needed
-	// for VAD to split speech regions. If <= 0, the VAD implementation default
-	// is used.
-	VADMinSilenceDuration float32
-
-	// VADMinSpeechDuration is the minimum speech duration in seconds required
-	// for VAD to emit a speech region. If <= 0, the VAD implementation default
-	// is used.
-	VADMinSpeechDuration float32
-
-	// VADSegmentPadding expands each detected speech segment by this many
-	// seconds on both sides before chunking. If <= 0, no padding is applied.
-	VADSegmentPadding float64
-
-	// WordTimestamps requests word-level timing from the engine.
-	WordTimestamps bool
-
-	// Language is a BCP-47 hint passed to the engine (empty = auto-detect).
-	Language string
-
-	// VADModelPath is the filesystem path to the Silero VAD ONNX model.
-	// Only required when VADEnabled is true.
-	VADModelPath string
-
-	// Debug enables detailed console logging.
-	Debug bool
-}
 
 // Pipeline ties together audio decoding, optional VAD, chunking, engine
 // inference, and result stitching.
 type Pipeline struct {
-	engine types.Engine
+	engine speech.Engine
 	vad    *VAD
-	config PipelineConfig
+	config config.Pipeline
 	ready  atomic.Bool
 }
 
 // New creates a Pipeline that delegates transcription to the given engine.
-func New(eng types.Engine) *Pipeline {
+func New(eng speech.Engine) *Pipeline {
 	p := &Pipeline{
 		engine: eng,
 	}
@@ -82,7 +37,7 @@ func New(eng types.Engine) *Pipeline {
 }
 
 // NewPipeline creates a fully configured Pipeline.
-func NewPipeline(eng types.Engine, cfg PipelineConfig) (*Pipeline, error) {
+func NewPipeline(eng speech.Engine, cfg config.Pipeline) (*Pipeline, error) {
 	p := &Pipeline{
 		engine: eng,
 		config: cfg,
@@ -94,6 +49,7 @@ func NewPipeline(eng types.Engine, cfg PipelineConfig) (*Pipeline, error) {
 			cfg.VADThreshold,
 			cfg.VADMinSilenceDuration,
 			cfg.VADMinSpeechDuration,
+			cfg.NumThreads,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("pipeline: init VAD: %w", err)
@@ -131,7 +87,7 @@ func (p *Pipeline) Close() error {
 }
 
 // TranscribeFile decodes the audio file at path and runs the full pipeline.
-func (p *Pipeline) TranscribeFile(ctx context.Context, path string, opts types.Options) (*types.Result, error) {
+func (p *Pipeline) TranscribeFile(ctx context.Context, path string, opts speech.Options) (*speech.Result, error) {
 	if !p.ready.Load() {
 		return nil, fmt.Errorf("pipeline: not ready, model is still loading")
 	}
@@ -147,13 +103,13 @@ func (p *Pipeline) TranscribeFile(ctx context.Context, path string, opts types.O
 
 // Process decodes the audio file at audioPath and runs the pipeline.
 // If chunkDuration is > 0, it overrides the pipeline's default setting.
-func (p *Pipeline) Process(ctx context.Context, audioPath string, chunkDuration float64) (*types.Result, error) {
+func (p *Pipeline) Process(ctx context.Context, audioPath string, chunkDuration float64) (*speech.Result, error) {
 	samples, sampleRate, channels, err := decodeAudioFile(audioPath)
 	if err != nil {
 		return nil, fmt.Errorf("pipeline: decode: %w", err)
 	}
 
-	opts := types.Options{
+	opts := speech.Options{
 		Language:       p.config.Language,
 		WordTimestamps: p.config.WordTimestamps,
 		Debug:          p.config.Debug,
@@ -167,8 +123,8 @@ func (p *Pipeline) Process(ctx context.Context, audioPath string, chunkDuration 
 }
 
 // ProcessAudio runs the pipeline on pre-decoded audio samples.
-func (p *Pipeline) ProcessAudio(ctx context.Context, samples []float32, sampleRate int, chunkDuration float64) (*types.Result, error) {
-	opts := types.Options{
+func (p *Pipeline) ProcessAudio(ctx context.Context, samples []float32, sampleRate int, chunkDuration float64) (*speech.Result, error) {
+	opts := speech.Options{
 		Language:       p.config.Language,
 		WordTimestamps: p.config.WordTimestamps,
 		Debug:          p.config.Debug,
@@ -182,15 +138,14 @@ func (p *Pipeline) ProcessAudio(ctx context.Context, samples []float32, sampleRa
 }
 
 // processAudioInternal is the core pipeline implementation.
-func (p *Pipeline) processAudioInternal(ctx context.Context, samples []float32, sampleRate int, channels int, opts types.Options, chunkDuration float64) (*types.Result, error) {
+func (p *Pipeline) processAudioInternal(ctx context.Context, samples []float32, sampleRate int, channels int, opts speech.Options, chunkDuration float64) (*speech.Result, error) {
 	const targetRate = 16000
 
 	totalStart := time.Now()
 
-	resampled, err := p.decodeAndResample(samples, sampleRate, channels, targetRate)
-	if err != nil {
-		return nil, err
-	}
+	// Audit signal quality
+	p.verifySignal(samples, targetRate)
+	resampled := samples
 
 	segments, err := p.prepareSpeechSegments(resampled, targetRate)
 	if err != nil {
@@ -217,27 +172,26 @@ func (p *Pipeline) processAudioInternal(ctx context.Context, samples []float32, 
 	return combined, nil
 }
 
-func (p *Pipeline) decodeAndResample(samples []float32, sampleRate int, channels int, targetRate int) ([]float32, error) {
-	decodeStart := time.Now()
-	if channels <= 0 {
-		channels = 1
-	}
-	mono := audio.ToMono(samples, channels)
-	resampled := audio.Resample(mono, sampleRate, targetRate)
-	decodeElapsed := time.Since(decodeStart)
+func (p *Pipeline) decodeAndResample(_ []float32, _ int, _ int, targetRate int) ([]float32, error) {
+	// The new DecodeWAV engine (via Sox) already returns 16kHz Mono samples.
+	// We keep this stage only for debug peak logging and signal verification.
+	// The incoming 'samples' are already 16kHz Mono.
+	return nil, fmt.Errorf("pipeline: internal logic error, raw samples should not be passed to decodeAndResample anymore")
+}
 
-	if p.config.Debug {
-		var peak float32
-		for _, s := range resampled {
-			abs := float32(math.Abs(float64(s)))
-			if abs > peak {
-				peak = abs
-			}
+// verifySignal checks the signal amplitude and logs the peak for debugging.
+func (p *Pipeline) verifySignal(samples []float32, targetRate int) {
+	if !p.config.Debug {
+		return
+	}
+	var peak float32
+	for _, s := range samples {
+		abs := float32(math.Abs(float64(s)))
+		if abs > peak {
+			peak = abs
 		}
-		fmt.Fprintf(os.Stderr, "   [Pipeline] Stage decode_resample=%s samples=%d duration=%.2fs peak=%.4f\n", decodeElapsed.Round(time.Millisecond), len(resampled), float64(len(resampled))/float64(targetRate), peak)
 	}
-
-	return resampled, nil
+	fmt.Fprintf(os.Stderr, "   [Pipeline] Stage decode_verified samples=%d duration=%.2fs peak=%.4f\n", len(samples), float64(len(samples))/float64(targetRate), peak)
 }
 
 func (p *Pipeline) prepareSpeechSegments(samples []float32, sampleRate int) ([]SpeechSegment, error) {
@@ -247,46 +201,15 @@ func (p *Pipeline) prepareSpeechSegments(samples []float32, sampleRate int) ([]S
 		return nil, fmt.Errorf("pipeline: VAD: %w", err)
 	}
 
-	audioDuration := float64(len(samples)) / float64(sampleRate)
-	rawSegments := make([]SpeechSegment, len(segments))
-	copy(rawSegments, segments)
-
-	padding := p.config.VADSegmentPadding
-	if padding < 0 {
-		padding = 0
-	}
-
-	for i := range segments {
-		segments[i].Start -= padding
-		segments[i].End += padding
-
-		if segments[i].Start < 0 {
-			segments[i].Start = 0
-		}
-		if segments[i].End < 0 {
-			segments[i].End = 0
-		}
-		if segments[i].Start > audioDuration {
-			segments[i].Start = audioDuration
-		}
-		if segments[i].End > audioDuration {
-			segments[i].End = audioDuration
-		}
-		if segments[i].End < segments[i].Start {
-			segments[i].End = segments[i].Start
-		}
-	}
-
 	if p.config.Debug {
-		fmt.Fprintf(os.Stderr, "   [Pipeline] Stage vad=%s segments=%d padding=%.2fs\n", time.Since(vadStart).Round(time.Millisecond), len(segments), padding)
+		audioDuration := float64(len(samples)) / float64(sampleRate)
+		fmt.Fprintf(os.Stderr, "   [Pipeline] Stage vad=%s segments=%d\n", time.Since(vadStart).Round(time.Millisecond), len(segments))
 		for i := range segments {
 			fmt.Fprintf(
 				os.Stderr,
-				"   [Pipeline] VAD segment %d/%d raw_start=%.2f raw_end=%.2f padded_start=%.2f padded_end=%.2f audio_duration=%.2f\n",
+				"   [Pipeline] VAD segment %d/%d start=%.2f end=%.2f audio_duration=%.2f\n",
 				i+1,
 				len(segments),
-				rawSegments[i].Start,
-				rawSegments[i].End,
 				segments[i].Start,
 				segments[i].End,
 				audioDuration,
@@ -306,7 +229,7 @@ func (p *Pipeline) buildChunks(segments []SpeechSegment, chunkDuration float64) 
 	return chunks
 }
 
-func (p *Pipeline) transcribeChunks(ctx context.Context, resampled []float32, targetRate int, chunks []Chunk, opts types.Options) ([]ChunkResult, error) {
+func (p *Pipeline) transcribeChunks(ctx context.Context, resampled []float32, targetRate int, chunks []Chunk, opts speech.Options) ([]ChunkResult, error) {
 	asrTotalStart := time.Now()
 	chunkResults := make([]ChunkResult, 0, len(chunks))
 
@@ -398,7 +321,7 @@ func (p *Pipeline) detectSpeechSegments(samples []float32, sampleRate int) ([]Sp
 	return []SpeechSegment{{Start: 0, End: dur}}, nil
 }
 
-func (p *Pipeline) mergeOptions(opts types.Options) types.Options {
+func (p *Pipeline) mergeOptions(opts speech.Options) speech.Options {
 	if opts.Language == "" {
 		opts.Language = p.config.Language
 	}
@@ -409,9 +332,16 @@ func (p *Pipeline) mergeOptions(opts types.Options) types.Options {
 }
 
 func decodeAudioFile(path string) ([]float32, int, int, error) {
-	wv, err := audio.ReadWave(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return nil, 0, 0, err
 	}
-	return wv.Samples, wv.SampleRate, wv.Channels, nil
+	defer f.Close()
+
+	samples, err := audio.DecodeWAV(f)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	// DecodeWAV with Sox results in 16kHz Mono
+	return samples, 16000, 1, nil
 }

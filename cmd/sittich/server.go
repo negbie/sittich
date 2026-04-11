@@ -8,7 +8,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/negbie/sittich/internal/pipeline"
+	"github.com/negbie/sittich/internal/config"
 	"github.com/negbie/sittich/internal/server"
 	"github.com/negbie/sittich/internal/worker"
 )
@@ -30,26 +30,26 @@ func runServer(opts *cliOptions) error {
 	fmt.Fprintln(os.Stderr, "Model loaded!   ")
 
 	// Create worker pool
-	serverOpts := &server.ServerOptions{
+	serverCfg := &config.Server{
 		ListenAddr:   opts.ListenAddr,
 		MaxUploadMB:  int64(opts.MaxUploadMB),
 		Workers:      opts.Workers,
-		MaxQueueSize: 10,
+		MaxQueueSize: config.DefaultMaxQueueSize,
 		Debug:        opts.Debug,
 	}
 	pool := worker.NewPool(
 		opts.Workers,
-		10,
+		config.DefaultMaxQueueSize,
 		recognizer,
-		pipeline.PipelineConfig{
+		config.Pipeline{
 			VADEnabled:            !opts.NoVAD,
 			ChunkDuration:         float64(opts.ChunkSize),
 			ChunkMinTailDuration:  opts.ChunkMinTailDuration,
 			VADThreshold:          float32(opts.VADThreshold),
 			VADMinSilenceDuration: float32(opts.VADMinSilenceDuration),
 			VADMinSpeechDuration:  float32(opts.VADMinSpeechDuration),
-			VADSegmentPadding:     opts.VADSegmentPadding,
-			Debug:                 opts.Debug,
+			NumThreads:             opts.NumThreads,
+			Debug:                  opts.Debug,
 		},
 		opts.Debug,
 		opts.DataFolder,
@@ -57,7 +57,7 @@ func runServer(opts *cliOptions) error {
 	defer pool.Shutdown()
 
 	// Create HTTP server
-	srv := server.NewServer(serverOpts, pool, version)
+	srv := server.NewServer(serverCfg, pool, version)
 	srv.SetDefaults(opts.Format, opts.ChunkSize)
 
 	// Start server

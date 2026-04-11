@@ -6,11 +6,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/negbie/sittich/internal/types"
+	"github.com/negbie/sittich/internal/speech"
 )
 
 // WriteVTT writes the transcription in WebVTT format
-func WriteVTT(out io.Writer, result *types.Result) error {
+func WriteVTT(out io.Writer, result *speech.Result) error {
 	fmt.Fprintln(out, "WEBVTT")
 	fmt.Fprintln(out)
 
