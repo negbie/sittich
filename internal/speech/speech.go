@@ -12,6 +12,9 @@ type Engine interface {
 	// normalised to [-1, 1]. sampleRate is in Hz (e.g. 16000).
 	Transcribe(ctx context.Context, audio []float32, sampleRate int, opts Options) (*Result, error)
 
+	// TranscribeBatch processes multiple raw PCM audio chunks in parallel.
+	TranscribeBatch(ctx context.Context, chunks [][]float32, sampleRate int, opts Options) ([]*Result, error)
+
 	// SupportedLanguages returns the BCP-47 language codes the engine can
 	// handle. An empty slice means the engine accepts any language (auto-detect).
 	SupportedLanguages() []string

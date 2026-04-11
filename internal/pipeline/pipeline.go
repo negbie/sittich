@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -20,7 +21,6 @@ import (
 // inference, and result stitching.
 type Pipeline struct {
 	engine speech.Engine
-	vad    *VAD
 	config config.Pipeline
 	ready  atomic.Bool
 }
@@ -41,20 +41,6 @@ func NewPipeline(eng speech.Engine, cfg config.Pipeline) (*Pipeline, error) {
 	p := &Pipeline{
 		engine: eng,
 		config: cfg,
-	}
-
-	if cfg.VADEnabled && cfg.VADModelPath != "" {
-		v, err := NewVAD(
-			cfg.VADModelPath,
-			cfg.VADThreshold,
-			cfg.VADMinSilenceDuration,
-			cfg.VADMinSpeechDuration,
-			cfg.NumThreads,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("pipeline: init VAD: %w", err)
-		}
-		p.vad = v
 	}
 
 	if eng != nil {
@@ -80,9 +66,6 @@ func (p *Pipeline) ModelName() string {
 // Close releases resources held by the pipeline.
 func (p *Pipeline) Close() error {
 	p.ready.Store(false)
-	if p.vad != nil {
-		p.vad.Close()
-	}
 	return nil
 }
 
@@ -137,9 +120,11 @@ func (p *Pipeline) ProcessAudio(ctx context.Context, samples []float32, sampleRa
 	return p.processAudioInternal(ctx, samples, sampleRate, 1, opts, chunkDuration)
 }
 
-// processAudioInternal is the core pipeline implementation.
 func (p *Pipeline) processAudioInternal(ctx context.Context, samples []float32, sampleRate int, channels int, opts speech.Options, chunkDuration float64) (*speech.Result, error) {
-	const targetRate = 16000
+	const (
+		targetRate = 16000
+		padding    = 0.30 // 300ms padding for context
+	)
 
 	totalStart := time.Now()
 
@@ -147,18 +132,49 @@ func (p *Pipeline) processAudioInternal(ctx context.Context, samples []float32, 
 	p.verifySignal(samples, targetRate)
 	resampled := samples
 
-	segments, err := p.prepareSpeechSegments(resampled, targetRate)
+	// 1. Tiling & Chunking
+	totalDur := float64(len(resampled)) / float64(targetRate)
+	var segments []SpeechSegment
+	for start := 0.0; start < totalDur; start += chunkDuration {
+		end := start + chunkDuration
+		if end > totalDur {
+			end = totalDur
+		}
+		segments = append(segments, SpeechSegment{Start: start, End: end})
+	}
+
+	// Expand segments into chunks with context padding
+	chunks := ChunkSpeechSegments(resampled, targetRate, segments, chunkDuration, p.config.ChunkOverlapDuration, p.config.ChunkMinTailDuration)
+	for i := range chunks {
+		chunks[i].Start -= padding
+		if chunks[i].Start < 0 {
+			chunks[i].Start = 0
+		}
+		chunks[i].End += padding
+		if chunks[i].End > totalDur {
+			chunks[i].End = totalDur
+		}
+	}
+
+	// 2. Unitary Request Batch Submit
+	// Instead of trickling chunks through workers, we submit the entire request
+	// as one batch. This allows the Global Dispatcher and the underlying engine
+	// to optimize the hardware utilization far more effectively.
+	allChunkResults, err := p.transcribeChunks(ctx, resampled, targetRate, chunks, opts)
 	if err != nil {
 		return nil, err
 	}
 
-	chunks := p.buildChunks(segments, chunkDuration)
-	chunkResults, err := p.transcribeChunks(ctx, resampled, targetRate, chunks, opts)
-	if err != nil {
-		return nil, err
+	if len(allChunkResults) == 0 {
+		return &speech.Result{Duration: float64(len(resampled)) / targetRate}, nil
 	}
 
-	combined := StitchResults(chunkResults)
+	// Ensure results are sorted by offset for stitching
+	sort.Slice(allChunkResults, func(i, j int) bool {
+		return allChunkResults[i].Offset < allChunkResults[j].Offset
+	})
+
+	combined := StitchResults(allChunkResults)
 	combined.Duration = float64(len(resampled)) / targetRate
 
 	for i := range combined.Segments {
@@ -166,7 +182,7 @@ func (p *Pipeline) processAudioInternal(ctx context.Context, samples []float32, 
 	}
 
 	if p.config.Debug {
-		fmt.Fprintf(os.Stderr, "   [Pipeline] Stage total=%s result_text_len=%d\n", time.Since(totalStart).Round(time.Millisecond), len(combined.FullText()))
+		fmt.Fprintf(os.Stderr, "   [Pipeline] Stage total=%s result_text_len=%d chunks=%d\n", time.Since(totalStart).Round(time.Millisecond), len(combined.FullText()), len(allChunkResults))
 	}
 
 	return combined, nil
@@ -194,52 +210,13 @@ func (p *Pipeline) verifySignal(samples []float32, targetRate int) {
 	fmt.Fprintf(os.Stderr, "   [Pipeline] Stage decode_verified samples=%d duration=%.2fs peak=%.4f\n", len(samples), float64(len(samples))/float64(targetRate), peak)
 }
 
-func (p *Pipeline) prepareSpeechSegments(samples []float32, sampleRate int) ([]SpeechSegment, error) {
-	vadStart := time.Now()
-	segments, err := p.detectSpeechSegments(samples, sampleRate)
-	if err != nil {
-		return nil, fmt.Errorf("pipeline: VAD: %w", err)
-	}
-
-	if p.config.Debug {
-		audioDuration := float64(len(samples)) / float64(sampleRate)
-		fmt.Fprintf(os.Stderr, "   [Pipeline] Stage vad=%s segments=%d\n", time.Since(vadStart).Round(time.Millisecond), len(segments))
-		for i := range segments {
-			fmt.Fprintf(
-				os.Stderr,
-				"   [Pipeline] VAD segment %d/%d start=%.2f end=%.2f audio_duration=%.2f\n",
-				i+1,
-				len(segments),
-				segments[i].Start,
-				segments[i].End,
-				audioDuration,
-			)
-		}
-	}
-
-	return segments, nil
-}
-
-func (p *Pipeline) buildChunks(segments []SpeechSegment, chunkDuration float64) []Chunk {
-	chunkStart := time.Now()
-	chunks := ChunkSpeechSegments(segments, chunkDuration, p.config.ChunkMinTailDuration)
-	if p.config.Debug {
-		fmt.Fprintf(os.Stderr, "   [Pipeline] Stage chunking=%s chunks=%d max_chunk=%.2fs min_tail=%.2fs\n", time.Since(chunkStart).Round(time.Millisecond), len(chunks), chunkDuration, p.config.ChunkMinTailDuration)
-	}
-	return chunks
-}
-
 func (p *Pipeline) transcribeChunks(ctx context.Context, resampled []float32, targetRate int, chunks []Chunk, opts speech.Options) ([]ChunkResult, error) {
 	asrTotalStart := time.Now()
-	chunkResults := make([]ChunkResult, 0, len(chunks))
 
-	for idx, c := range chunks {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
-		}
+	batch := make([][]float32, 0, len(chunks))
+	offsets := make([]float64, 0, len(chunks))
 
+	for _, c := range chunks {
 		startSample := int(c.Start * float64(targetRate))
 		endSample := int(c.End * float64(targetRate))
 		if startSample < 0 {
@@ -249,76 +226,45 @@ func (p *Pipeline) transcribeChunks(ctx context.Context, resampled []float32, ta
 			endSample = len(resampled)
 		}
 
-		if p.config.Debug {
-			fmt.Fprintf(os.Stderr, "   [Pipeline] Chunk %d/%d bounds start=%.2f end=%.2f start_sample=%d end_sample=%d\n", idx+1, len(chunks), c.Start, c.End, startSample, endSample)
-		}
 		if startSample >= endSample {
-			if p.config.Debug {
-				fmt.Fprintf(os.Stderr, "   [Pipeline] Chunk %d/%d skipped invalid_bounds start_sample=%d end_sample=%d\n", idx+1, len(chunks), startSample, endSample)
-			}
 			continue
 		}
 
 		chunkAudio := resampled[startSample:endSample]
 		if len(chunkAudio) == 0 {
-			if p.config.Debug {
-				fmt.Fprintf(os.Stderr, "   [Pipeline] Chunk %d/%d skipped empty_audio start=%.2f end=%.2f\n", idx+1, len(chunks), c.Start, c.End)
-			}
 			continue
 		}
 
-		chunkASRStart := time.Now()
-		if p.config.Debug {
-			fmt.Fprintf(os.Stderr, "   [Pipeline] Chunk %d/%d start=%.2f end=%.2f samples=%d\n", idx+1, len(chunks), c.Start, c.End, len(chunkAudio))
-		}
+		batch = append(batch, chunkAudio)
+		offsets = append(offsets, c.Start)
+	}
 
-		res, err := p.engine.Transcribe(ctx, chunkAudio, targetRate, opts)
-		if err != nil {
-			return nil, fmt.Errorf("pipeline: transcribe chunk [%.2f-%.2f]: %w", c.Start, c.End, err)
-		}
-
-		if p.config.Debug {
-			fmt.Fprintf(os.Stderr, "   [Pipeline] Chunk %d/%d asr=%s\n", idx+1, len(chunks), time.Since(chunkASRStart).Round(time.Millisecond))
-			if res == nil {
-				fmt.Fprintf(os.Stderr, "   [Pipeline] Chunk %d/%d empty_result=nil\n", idx+1, len(chunks))
-			} else {
-				textLen := len(strings.TrimSpace(res.FullText()))
-				segmentCount := len(res.Segments)
-				fmt.Fprintf(os.Stderr, "   [Pipeline] Chunk %d/%d result_text_len=%d segments=%d\n", idx+1, len(chunks), textLen, segmentCount)
-				if textLen == 0 {
-					fmt.Fprintf(os.Stderr, "   [Pipeline] Chunk %d/%d empty_result start=%.2f end=%.2f samples=%d\n", idx+1, len(chunks), c.Start, c.End, len(chunkAudio))
-				}
-			}
-		}
-
-		chunkResults = append(chunkResults, ChunkResult{
-			Offset: c.Start,
-			Result: res,
-		})
+	if len(batch) == 0 {
+		return nil, nil
 	}
 
 	if p.config.Debug {
-		fmt.Fprintf(os.Stderr, "   [Pipeline] Stage asr_total=%s\n", time.Since(asrTotalStart).Round(time.Millisecond))
+		fmt.Fprintf(os.Stderr, "   [Pipeline] Stage batch_asr_start chunks=%d\n", len(batch))
+	}
+
+	results, err := p.engine.TranscribeBatch(ctx, batch, targetRate, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	chunkResults := make([]ChunkResult, len(results))
+	for i, res := range results {
+		chunkResults[i] = ChunkResult{
+			Offset: offsets[i],
+			Result: res,
+		}
+	}
+
+	if p.config.Debug {
+		fmt.Fprintf(os.Stderr, "   [Pipeline] Stage batch_asr_total=%s chunks=%d\n", time.Since(asrTotalStart).Round(time.Millisecond), len(chunks))
 	}
 
 	return chunkResults, nil
-}
-
-func (p *Pipeline) detectSpeechSegments(samples []float32, sampleRate int) ([]SpeechSegment, error) {
-	if p.vad != nil && p.config.VADEnabled {
-		segs, err := p.vad.DetectSpeech(samples, sampleRate)
-		if err != nil {
-			return nil, err
-		}
-		if len(segs) == 0 {
-			dur := float64(len(samples)) / float64(sampleRate)
-			return []SpeechSegment{{Start: 0, End: dur}}, nil
-		}
-		return segs, nil
-	}
-
-	dur := float64(len(samples)) / float64(sampleRate)
-	return []SpeechSegment{{Start: 0, End: dur}}, nil
 }
 
 func (p *Pipeline) mergeOptions(opts speech.Options) speech.Options {

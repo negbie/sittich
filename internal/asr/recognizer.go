@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"slices"
-	"strings"
 	"sync"
 
 	sherpa "github.com/k2-fsa/sherpa-onnx-go/sherpa_onnx"
@@ -30,7 +28,7 @@ func NewRecognizer(cfg *config.ASR) (*Recognizer, error) {
 	sherpaConfig := sherpa.OfflineRecognizerConfig{
 		FeatConfig: sherpa.FeatureConfig{
 			SampleRate: 16000,
-			FeatureDim: 80,
+			FeatureDim: 128,
 		},
 		ModelConfig: sherpa.OfflineModelConfig{
 			Transducer: sherpa.OfflineTransducerModelConfig{
@@ -67,11 +65,22 @@ func NewRecognizer(cfg *config.ASR) (*Recognizer, error) {
 // allows concurrent Decode calls on independent streams while preventing Close
 // from freeing the recognizer during in-flight work.
 func (r *Recognizer) Transcribe(ctx context.Context, audio []float32, sampleRate int, opts speech.Options) (*speech.Result, error) {
+	results, err := r.TranscribeBatch(ctx, [][]float32{audio}, sampleRate, opts)
+	if err != nil {
+		return nil, err
+	}
+	if len(results) == 0 {
+		return &speech.Result{}, nil
+	}
+	return results[0], nil
+}
+
+// TranscribeBatch handles multiple raw PCM audio chunks in parallel.
+func (r *Recognizer) TranscribeBatch(ctx context.Context, chunks [][]float32, sampleRate int, opts speech.Options) ([]*speech.Result, error) {
 	if r == nil {
 		return nil, fmt.Errorf("recognizer is nil")
 	}
 
-	// Check if context is already dead
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -82,17 +91,41 @@ func (r *Recognizer) Transcribe(ctx context.Context, audio []float32, sampleRate
 		return nil, fmt.Errorf("recognizer already closed")
 	}
 
-	stream := sherpa.NewOfflineStream(r.recognizer)
-	if stream == nil {
-		r.mu.Unlock()
-		return nil, fmt.Errorf("failed to create offline stream")
+	streams := make([]*sherpa.OfflineStream, 0, len(chunks))
+	for _, audio := range chunks {
+		s := sherpa.NewOfflineStream(r.recognizer)
+		if s == nil {
+			// Cleanup already created streams
+			for _, st := range streams {
+				sherpa.DeleteOfflineStream(st)
+			}
+			r.mu.Unlock()
+			return nil, fmt.Errorf("failed to create offline stream")
+		}
+
+		// Process audio
+		calibration := r.calibrateAudio(audio)
+		if opts.Debug {
+			fmt.Fprintf(
+				os.Stderr,
+				"   [Recognizer] scale=%.3f clipped=%d skipped=%v\n",
+				calibration.Scale,
+				calibration.Clipped,
+				calibration.Skipped,
+			)
+		}
+
+		s.AcceptWaveform(sampleRate, audio)
+		streams = append(streams, s)
 	}
 
 	r.active++
 	r.mu.Unlock()
 
 	defer func() {
-		sherpa.DeleteOfflineStream(stream)
+		for _, s := range streams {
+			sherpa.DeleteOfflineStream(s)
+		}
 
 		r.mu.Lock()
 		r.active--
@@ -102,69 +135,48 @@ func (r *Recognizer) Transcribe(ctx context.Context, audio []float32, sampleRate
 		r.mu.Unlock()
 	}()
 
-	// Process audio
-	calibration := r.calibrateAudio(audio)
-	if opts.Debug {
-		fmt.Fprintf(
-			os.Stderr,
-			"   [Recognizer] calibration samples=%d active_ratio=%.4f p99_peak=%.6f scale=%.3f clipped=%d skipped=%v reason=%s\n",
-			len(audio),
-			calibration.ActiveRatio,
-			calibration.Peak,
-			calibration.Scale,
-			calibration.ClippedSamples,
-			calibration.Skipped,
-			calibration.SkipReason,
-		)
-	}
-	stream.AcceptWaveform(sampleRate, audio)
-	r.recognizer.Decode(stream)
+	r.recognizer.DecodeStreams(streams)
 
-	// Get result
-	sherpaResult := stream.GetResult()
-	if sherpaResult == nil {
-		if opts.Debug {
-			fmt.Fprintf(os.Stderr, "   [Recognizer] empty_result=nil sample_rate=%d samples=%d\n", sampleRate, len(audio))
+	// Collect results
+	results := make([]*speech.Result, len(streams))
+	for i, s := range streams {
+		sherpaResult := s.GetResult()
+		if sherpaResult == nil {
+			results[i] = &speech.Result{}
+			continue
 		}
-		return &speech.Result{}, nil
-	}
-	if opts.Debug {
-		textLen := len(strings.TrimSpace(sherpaResult.Text))
-		fmt.Fprintf(os.Stderr, "   [Recognizer] result_text_len=%d tokens=%d timestamps=%d\n", textLen, len(sherpaResult.Tokens), len(sherpaResult.Timestamps))
-		if textLen == 0 {
-			fmt.Fprintf(os.Stderr, "   [Recognizer] empty_result=text sample_rate=%d samples=%d\n", sampleRate, len(audio))
+
+		duration := float64(len(chunks[i])) / float64(sampleRate)
+		res := &speech.Result{
+			Duration: duration,
+			Language: "", // Sherpa-ONNX offline doesn't always return language per result
 		}
-	}
 
-	// Convert to internal types
-	result := &speech.Result{
-		Duration: float64(len(audio)) / float64(sampleRate),
-	}
+		res.Segments = []speech.Segment{
+			{
+				ID:    0,
+				Start: 0,
+				End:   duration,
+				Text:  sherpaResult.Text,
+			},
+		}
 
-	result.Segments = []speech.Segment{
-		{
-			ID:    0,
-			Start: 0,
-			End:   result.Duration,
-			Text:  sherpaResult.Text,
-		},
-	}
-
-	// Map timestamps if available
-	if len(sherpaResult.Timestamps) > 0 {
-		result.Segments[0].Words = make([]speech.Word, len(sherpaResult.Tokens))
-		for i, token := range sherpaResult.Tokens {
-			if i < len(sherpaResult.Timestamps) {
-				result.Segments[0].Words[i] = speech.Word{
-					Word:  token,
-					Start: float64(sherpaResult.Timestamps[i]),
-					End:   float64(sherpaResult.Timestamps[i]) + 0.1,
+		if len(sherpaResult.Timestamps) > 0 {
+			res.Segments[0].Words = make([]speech.Word, len(sherpaResult.Tokens))
+			for j, token := range sherpaResult.Tokens {
+				if j < len(sherpaResult.Timestamps) {
+					res.Segments[0].Words[j] = speech.Word{
+						Word:  token,
+						Start: float64(sherpaResult.Timestamps[j]),
+						End:   float64(sherpaResult.Timestamps[j]) + 0.1,
+					}
 				}
 			}
 		}
+		results[i] = res
 	}
 
-	return result, nil
+	return results, nil
 }
 
 // SupportedLanguages returns empty (auto-detect or as directed by model).
@@ -205,118 +217,42 @@ func (r *Recognizer) Close() error {
 	return nil
 }
 
-// calibrationStats captures chunk-level calibration behavior for debug logging.
-type calibrationStats struct {
-	ActiveRatio    float64
-	Peak           float32
-	Scale          float32
-	ClippedSamples int
-	Skipped        bool
-	SkipReason     string
+// CalibrationStats holds details about signal processing.
+type CalibrationStats struct {
+	Scale   float32
+	Clipped int
+	Skipped bool
 }
 
-// calibrateAudio adjusts the signal in-place for Parakeet-TDT INT8 calibration.
-// It keeps the original German-friendly robust-peak strategy, but adds light
-// gating and gain caps so silence/noise is less likely to be over-amplified.
-func (r *Recognizer) calibrateAudio(audio []float32) calibrationStats {
-	stats := calibrationStats{
-		Scale:      1.0,
-		Skipped:    true,
-		SkipReason: "empty_audio",
+// calibrateAudio applies a fixed gain to the audio samples to bring them
+// into the optimal range for the transuder model.
+func (r *Recognizer) calibrateAudio(audio []float32) CalibrationStats {
+	stats := CalibrationStats{
+		Scale: 1.0,
 	}
 
 	n := len(audio)
 	if n == 0 {
+		stats.Skipped = true
 		return stats
 	}
 
-	const (
-		gateThreshold  = 0.003
-		minActiveRatio = 0.01
-		minPeak        = 1e-4
-		minGain        = 1.0
-		clipLimit      = 220.0
-	)
-
-	maxMSamples := 8192
-	targetPeak := float32(180.0)
-	maxGain := float32(200.0)
-
+	scale := float32(20.0)
 	if r != nil && r.Config != nil {
-		if r.Config.CalibrationMaxMSamples > 0 {
-			maxMSamples = r.Config.CalibrationMaxMSamples
-		}
-		if r.Config.CalibrationTargetPeak > 0 {
-			targetPeak = r.Config.CalibrationTargetPeak
-		}
-		if r.Config.CalibrationMaxGain > 0 {
-			maxGain = r.Config.CalibrationMaxGain
-		}
-	}
-
-	m := n
-	if m > maxMSamples {
-		m = maxMSamples
-	}
-
-	tmp := make([]float32, 0, m)
-	stride := float64(n) / float64(m)
-
-	for i := 0; i < m; i++ {
-		v := audio[int(float64(i)*stride)]
-		if v < 0 {
-			v = -v
-		}
-		if v >= gateThreshold {
-			tmp = append(tmp, v)
-		}
-	}
-
-	if len(tmp) == 0 {
-		stats.SkipReason = "no_active_samples"
-		return stats
-	}
-
-	stats.ActiveRatio = float64(len(tmp)) / float64(m)
-	if stats.ActiveRatio < minActiveRatio {
-		stats.SkipReason = "active_ratio_below_threshold"
-		return stats
-	}
-
-	slices.Sort(tmp)
-
-	idx := int(float64(len(tmp)) * 0.99)
-	if idx >= len(tmp) {
-		idx = len(tmp) - 1
-	}
-	peak := tmp[idx]
-	stats.Peak = peak
-
-	if peak < minPeak {
-		stats.SkipReason = "peak_below_threshold"
-		return stats
-	}
-
-	scale := targetPeak / peak
-	if scale < minGain {
-		scale = minGain
-	} else if scale > maxGain {
-		scale = maxGain
+		scale = r.Config.FixedScale
 	}
 	stats.Scale = scale
-	stats.Skipped = false
-	stats.SkipReason = "none"
 
-	for i, v := range audio {
-		nv := v * scale
-		if nv > clipLimit {
-			nv = clipLimit
-			stats.ClippedSamples++
-		} else if nv < -clipLimit {
-			nv = -clipLimit
-			stats.ClippedSamples++
+	if scale == 1.0 {
+		return stats
+	}
+
+	for i := 0; i < n; i++ {
+		v := audio[i] * scale
+		if v > 1.0 || v < -1.0 {
+			stats.Clipped++
 		}
-		audio[i] = nv
+		audio[i] = v
 	}
 
 	return stats

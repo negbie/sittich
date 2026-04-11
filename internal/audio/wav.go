@@ -8,53 +8,65 @@ import (
 	"os/exec"
 )
 
-// DecodeWAV decodes any WAV file by shelling out to 'sox'.
+// DecodeWAV decodes any audio file by shelling out to 'sox'. It streams the
+// output directly into a float32 slice to minimize memory allocations.
 func DecodeWAV(r io.Reader) ([]float32, error) {
-	tempFile, err := os.CreateTemp("", "sittich-*.wav")
+	// 1. Probe the file length if it's a file on disk to pre-allocate memory
+	var initialCapacity int
+	if f, ok := r.(*os.File); ok {
+		if st, err := f.Stat(); err == nil && st.Size() > 0 {
+			// Rough estimate: raw 16kHz Mono is ~32KB/sec.
+			// Input file size is a good upper bound for capacity.
+			initialCapacity = int(st.Size() / 2)
+		}
+	}
+	if initialCapacity < 1024*1024 {
+		initialCapacity = 1024 * 1024 // Default to 1min of audio
+	}
+
+	args := []string{
+		"-",
+		"-t", "raw", "-r", "16000", "-c", "1", "-e", "signed-integer", "-b", "16", "-",
+	}
+
+	cmd := exec.Command("sox", args...)
+	cmd.Stdin = r
+	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return nil, fmt.Errorf("audio: create temp: %w", err)
+		return nil, fmt.Errorf("audio: stdout pipe: %w", err)
 	}
-	defer os.Remove(tempFile.Name())
-	defer tempFile.Close()
+	defer stdout.Close()
 
-	if _, err := io.Copy(tempFile, r); err != nil {
-		return nil, fmt.Errorf("audio: buffer wav: %w", err)
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("audio: failed to start sox: %w", err)
 	}
 
-	// Minimal peeker: Peek sample rate to decide filter strategy.
-	rate := uint32(16000)
-	var buf [32]byte
-	if n, _ := tempFile.ReadAt(buf[:], 0); n == 32 {
-		for i := 0; i < 24; i++ {
-			if string(buf[i:i+4]) == "fmt " {
-				rate = binary.LittleEndian.Uint32(buf[i+12 : i+16])
-				break
+	samples := make([]float32, 0, initialCapacity)
+	buf := make([]byte, 32*1024)
+
+	for {
+		n, err := io.ReadFull(stdout, buf)
+		if n > 0 {
+			// Convert every 2 bytes (int16) to a float32
+			for i := 0; i < n; i += 2 {
+				v := int16(binary.LittleEndian.Uint16(buf[i:]))
+				samples = append(samples, float32(v)/32768.0)
 			}
+		}
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("audio: read sox pipe: %w", err)
 		}
 	}
 
-	args := []string{tempFile.Name(), "-t", "raw", "-r", "16000", "-c", "1", "-e", "signed-integer", "-b", "16", "-"}
-	
-	// Apply accuracy filters ONLY for low-bandwidth audio (<= 8kHz).
-	if rate <= 8000 {
-		args = append(args, "highpass", "80", "lowpass", "3500")
-	}
-	
-	// args = append(args, "norm", "-1")
-
-	cmd := exec.Command("sox", args...)
-	out, err := cmd.Output()
-	if err != nil {
+	if err := cmd.Wait(); err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			return nil, fmt.Errorf("sox error: %s", string(exitErr.Stderr))
 		}
-		return nil, fmt.Errorf("failed to run sox: %w (is sox installed?)", err)
+		return nil, fmt.Errorf("sox wait: %w", err)
 	}
 
-	samples := make([]float32, len(out)/2)
-	for i := 0; i < len(samples); i++ {
-		v := int16(binary.LittleEndian.Uint16(out[i*2:]))
-		samples[i] = float32(v) / 32768.0
-	}
 	return samples, nil
 }

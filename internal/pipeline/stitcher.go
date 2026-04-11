@@ -1,6 +1,8 @@
 package pipeline
 
 import (
+	"strings"
+
 	"github.com/negbie/sittich/internal/speech"
 )
 
@@ -13,57 +15,195 @@ type ChunkResult struct {
 
 // StitchResults merges multiple ChunkResults into a single speech.Result by
 // offsetting chunk-relative timestamps into the original audio timeline and
-// appending segments in order.
+// merging overlapping regions using a token-level LCS algorithm.
 func StitchResults(chunks []ChunkResult) *speech.Result {
-	combined := &speech.Result{}
-
 	if len(chunks) == 0 {
-		return combined
+		return &speech.Result{}
 	}
 
-	segID := 0
-	var maxEnd float64
+	combined := &speech.Result{}
+	if combined.Language == "" {
+		for _, cr := range chunks {
+			if cr.Result != nil && cr.Result.Language != "" {
+				combined.Language = cr.Result.Language
+				combined.LanguageProb = cr.Result.LanguageProb
+				break
+			}
+		}
+	}
 
-	for _, cr := range chunks {
+	// 1. Shift all timestamps to global timeline
+	for i := range chunks {
+		cr := &chunks[i]
 		if cr.Result == nil {
 			continue
 		}
-
-		if combined.Language == "" && cr.Result.Language != "" {
-			combined.Language = cr.Result.Language
-			combined.LanguageProb = cr.Result.LanguageProb
-		}
-
-		for _, seg := range cr.Result.Segments {
-			shifted := speech.Segment{
-				ID:           segID,
-				Start:        seg.Start + cr.Offset,
-				End:          seg.End + cr.Offset,
-				Text:         seg.Text,
-				AvgLogProb:   seg.AvgLogProb,
-				NoSpeechProb: seg.NoSpeechProb,
-				Words:        make([]speech.Word, len(seg.Words)),
+		for j := range cr.Result.Segments {
+			seg := &cr.Result.Segments[j]
+			seg.Start += cr.Offset
+			seg.End += cr.Offset
+			for k := range seg.Words {
+				w := &seg.Words[k]
+				w.Start += cr.Offset
+				w.End += cr.Offset
 			}
-
-			for j, w := range seg.Words {
-				shifted.Words[j] = speech.Word{
-					Word:  w.Word,
-					Start: w.Start + cr.Offset,
-					End:   w.End + cr.Offset,
-					Prob:  w.Prob,
-				}
-			}
-
-			if shifted.End > maxEnd {
-				maxEnd = shifted.End
-			}
-
-			combined.Segments = append(combined.Segments, shifted)
-			segID++
 		}
 	}
 
-	combined.Duration = maxEnd
+	// 2. Merge chunks sequentially
+	allWords := make([]speech.Word, 0)
+	for i, cr := range chunks {
+		if cr.Result == nil || len(cr.Result.Segments) == 0 {
+			continue
+		}
+
+		chunkWords := make([]speech.Word, 0)
+		for _, seg := range cr.Result.Segments {
+			chunkWords = append(chunkWords, seg.Words...)
+		}
+
+		if i == 0 {
+			allWords = append(allWords, chunkWords...)
+			continue
+		}
+
+		// Handle overlap with the words already in allWords
+		if len(allWords) == 0 {
+			allWords = append(allWords, chunkWords...)
+			continue
+		}
+
+		// Find relevant words in the overlap period
+		// We use a window of overlap to search for common tokens
+		lastTokenGlobalEnd := allWords[len(allWords)-1].End
+		overlapStart := chunkWords[0].Start
+
+		if overlapStart >= lastTokenGlobalEnd {
+			// No temporal overlap, just append
+			allWords = append(allWords, chunkWords...)
+			continue
+		}
+
+		// Find anchor in allWords and chunkWords using LCS
+		// Look back/forward up to 2 seconds or 20 words
+		const windowWords = 20
+		aStart := len(allWords) - windowWords
+		if aStart < 0 {
+			aStart = 0
+		}
+		a := allWords[aStart:]
+
+		bEnd := windowWords
+		if bEnd > len(chunkWords) {
+			bEnd = len(chunkWords)
+		}
+		b := chunkWords[:bEnd]
+
+		// Perform LCS on word text
+		aTexts := make([]string, len(a))
+		for i, w := range a {
+			aTexts[i] = normalizeForMatch(w.Word)
+		}
+		bTexts := make([]string, len(b))
+		for i, w := range b {
+			bTexts[i] = normalizeForMatch(w.Word)
+		}
+
+		lcsIndices := findLCS(aTexts, bTexts)
+		if len(lcsIndices) == 0 {
+			// No LCS found, just append (risky but fallback)
+			allWords = append(allWords, chunkWords...)
+			continue
+		}
+
+		// Pick the middle of the LCS as the split point
+		midLCS := len(lcsIndices) / 2
+		idxA := aStart + lcsIndices[midLCS].i
+		idxB := lcsIndices[midLCS].j
+
+		// Keep allWords up to idxA (exclusive) and chunkWords from idxB (exclusive)
+		// Wait, if it's the middle of LCS, we should keep the LCS token from one of them.
+		// Let's keep it from allWords.
+		allWords = allWords[:idxA+1]
+		if idxB+1 < len(chunkWords) {
+			allWords = append(allWords, chunkWords[idxB+1:]...)
+		}
+	}
+
+	// 3. Rebuild segments from merged words
+	// For now, we put everything into one segment per result or try to keep them.
+	// Simple approach: one global segment.
+	resText := ""
+	for _, w := range allWords {
+		resText += w.Word
+	}
+	resText = strings.ReplaceAll(resText, " ", " ")
+	resText = strings.TrimSpace(resText)
+
+	combined.Segments = []speech.Segment{
+		{
+			ID:    0,
+			Start: 0,
+			End:   0,
+			Text:  resText,
+			Words: allWords,
+		},
+	}
+	if len(allWords) > 0 {
+		combined.Segments[0].Start = allWords[0].Start
+		combined.Segments[0].End = allWords[len(allWords)-1].End
+		combined.Duration = combined.Segments[0].End
+	}
 
 	return combined
+}
+
+type lcsMatch struct {
+	i, j int
+}
+
+func findLCS(a, b []string) []lcsMatch {
+	n, m := len(a), len(b)
+	if n == 0 || m == 0 {
+		return nil
+	}
+	dp := make([][]int, n+1)
+	for i := range dp {
+		dp[i] = make([]int, m+1)
+	}
+
+	for i := 1; i <= n; i++ {
+		for j := 1; j <= m; j++ {
+			if a[i-1] == b[j-1] && a[i-1] != "" {
+				dp[i][j] = dp[i-1][j-1] + 1
+			} else {
+				if dp[i-1][j] > dp[i][j-1] {
+					dp[i][j] = dp[i-1][j]
+				} else {
+					dp[i][j] = dp[i][j-1]
+				}
+			}
+		}
+	}
+
+	matches := make([]lcsMatch, 0)
+	i, j := n, m
+	for i > 0 && j > 0 {
+		if a[i-1] == b[j-1] && a[i-1] != "" {
+			matches = append([]lcsMatch{{i - 1, j - 1}}, matches...)
+			i--
+			j--
+		} else if dp[i-1][j] > dp[i][j-1] {
+			i--
+		} else {
+			j--
+		}
+	}
+	return matches
+}
+
+func normalizeForMatch(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	s = strings.Trim(s, ".,;!?:")
+	return s
 }

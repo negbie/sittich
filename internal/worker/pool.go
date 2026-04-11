@@ -9,10 +9,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/negbie/sittich/internal/asr"
 	"github.com/negbie/sittich/internal/config"
-	"github.com/negbie/sittich/internal/models"
 	"github.com/negbie/sittich/internal/pipeline"
+	"github.com/negbie/sittich/internal/speech"
 )
 
 // Pool manages a pool of transcription workers. Each worker has its own
@@ -20,7 +19,7 @@ import (
 type Pool struct {
 	workers      int
 	queue        chan *Job
-	recognizer   *asr.Recognizer
+	engine       speech.Engine
 	pipelineCfg  config.Pipeline
 	ctx          context.Context
 	cancel       context.CancelFunc
@@ -31,17 +30,13 @@ type Pool struct {
 }
 
 // NewPool creates a new worker pool
-func NewPool(workers int, queueSize int, recognizer *asr.Recognizer, cfg config.Pipeline, debug bool, dataDir string) *Pool {
+func NewPool(workers int, queueSize int, engine speech.Engine, cfg config.Pipeline, debug bool, dataDir string) *Pool {
 	ctx, cancel := context.WithCancel(context.Background())
-
-	vadPath, _ := models.GetVADPath(dataDir)
-	cfg.VADModelPath = vadPath
-	cfg.VADEnabled = cfg.VADEnabled && vadPath != ""
 
 	p := &Pool{
 		workers:    workers,
 		queue:      make(chan *Job, queueSize),
-		recognizer: recognizer,
+		engine:     engine,
 		pipelineCfg: cfg,
 		ctx:    ctx,
 		cancel: cancel,
@@ -84,9 +79,9 @@ func (p *Pool) Shutdown() {
 		close(p.queue)
 		p.wg.Wait()
 
-		// Explicitly close the shared recognizer once all workers are done
-		if p.recognizer != nil {
-			p.recognizer.Close()
+		// Explicitly close the shared engine once all workers are done
+		if p.engine != nil {
+			p.engine.Close()
 		}
 	})
 }
@@ -95,7 +90,7 @@ func (p *Pool) worker(id int) {
 	defer p.wg.Done()
 
 	// 1. Initialise a private Pipeline for this worker.
-	pipe, err := pipeline.NewPipeline(p.recognizer, p.pipelineCfg)
+	pipe, err := pipeline.NewPipeline(p.engine, p.pipelineCfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Worker %d: failed to initialise pipeline: %v\n", id, err)
 		return

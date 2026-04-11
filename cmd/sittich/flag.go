@@ -34,17 +34,14 @@ var (
 type cliOptions struct {
 	ListenAddr             string
 	ChunkSize              int
+	ChunkOverlapDuration   float64
 	ChunkMinTailDuration   float64
 	Format                 string
 	MaxActivePaths         int
 	DecodingMethod         string
 	NoVAD                  bool
-	VADThreshold           float64
-	VADMinSilenceDuration  float64
 	VADMinSpeechDuration   float64
-	CalibrationTargetPeak  float64
-	CalibrationMaxGain     float64
-	CalibrationMaxMSamples int
+	FixedScale             float64
 	DataFolder             string
 	Workers                int
 	NumThreads             int
@@ -74,17 +71,12 @@ var allFlags = []cliFlag{
 	{long: "max-upload", arg: "int", description: "max upload size in MB", defaultVal: strconv.Itoa(config.DefaultMaxUploadMB)},
 	{long: "format", arg: "string", description: "default output format: text, json, vtt", defaultVal: config.DefaultFormat},
 	{long: "chunk-size", arg: "int", description: "default chunk size in seconds", defaultVal: strconv.Itoa(config.DefaultChunkSize)},
+	{long: "chunk-overlap", arg: "float", description: "overlap duration between chunks in seconds", defaultVal: strconv.FormatFloat(config.DefaultChunkOverlap, 'f', 1, 64)},
 	{long: "chunk-min-tail", arg: "float", description: "minimum tail duration when balancing oversized chunks in seconds", defaultVal: strconv.FormatFloat(config.DefaultChunkMinTail, 'f', 1, 64)},
 	{long: "debug", description: "show detailed debug logs"},
 	{long: "max-active-paths", arg: "int", description: "number of active paths for modified beam search", defaultVal: strconv.Itoa(config.DefaultMaxActivePaths)},
-	{long: "decoding-method", arg: "string", description: "decoding method: greedy_search or modified_beam_search", defaultVal: config.DefaultDecodingMethod},
-	{long: "no-vad", description: "disable VAD"},
-	{long: "vad-threshold", arg: "float", description: "VAD speech threshold", defaultVal: strconv.FormatFloat(config.DefaultVADThreshold, 'f', 1, 64)},
-	{long: "vad-min-silence", arg: "float", description: "minimum silence duration for VAD splits in seconds", defaultVal: strconv.FormatFloat(config.DefaultVADMinSilence, 'f', 1, 64)},
-	{long: "vad-min-speech", arg: "float", description: "minimum speech duration for VAD segments in seconds", defaultVal: strconv.FormatFloat(config.DefaultVADMinSpeech, 'f', 2, 64)},
-	{long: "calibration-target-peak", arg: "float", description: "target robust peak used for audio calibration", defaultVal: strconv.FormatFloat(config.DefaultCalibrationTargetPeak, 'f', 1, 64)},
-	{long: "calibration-max-gain", arg: "float", description: "maximum gain applied during audio calibration", defaultVal: strconv.FormatFloat(config.DefaultCalibrationMaxGain, 'f', 1, 64)},
-	{long: "calibration-max-samples", arg: "int", description: "maximum sampled points used for calibration peak estimation", defaultVal: strconv.Itoa(config.DefaultCalibrationMaxMSamples)},
+	{long: "chunk-min-tail", arg: "float", description: "minimum tail duration when balancing oversized chunks in seconds", defaultVal: strconv.FormatFloat(config.DefaultChunkMinTail, 'f', 1, 64)},
+	{long: "scale", arg: "float", description: "fixed signal scale factor applied to audio", defaultVal: strconv.FormatFloat(config.DefaultFixedScale, 'f', 1, 64)},
 	{long: "data-folder", arg: "path", description: "path to model directory"},
 	{long: "version", description: "show version"},
 }
@@ -136,16 +128,11 @@ func parseCLI(args []string) (cliOptions, error) {
 	maxUploadMB := fs.Int("max-upload", config.DefaultMaxUploadMB, "max upload size in MB")
 	format := fs.String("format", config.DefaultFormat, "default output format (text, json, vtt)")
 	chunkSize := fs.Int("chunk-size", config.DefaultChunkSize, "default chunk size in seconds")
+	chunkOverlap := fs.Float64("chunk-overlap", config.DefaultChunkOverlap, "overlap duration between adjacent chunks in seconds")
 	chunkMinTail := fs.Float64("chunk-min-tail", config.DefaultChunkMinTail, "minimum tail duration when balancing oversized chunks in seconds")
 	maxActivePaths := fs.Int("max-active-paths", config.DefaultMaxActivePaths, "number of active paths for modified beam search")
 	decodingMethod := fs.String("decoding-method", config.DefaultDecodingMethod, "decoding method: greedy_search or modified_beam_search")
-	noVAD := fs.Bool("no-vad", false, "disable VAD")
-	vadThreshold := fs.Float64("vad-threshold", config.DefaultVADThreshold, "VAD speech threshold")
-	vadMinSilence := fs.Float64("vad-min-silence", config.DefaultVADMinSilence, "minimum silence duration for VAD splits in seconds")
-	vadMinSpeech := fs.Float64("vad-min-speech", config.DefaultVADMinSpeech, "minimum speech duration for VAD segments in seconds")
-	calibrationTargetPeak := fs.Float64("calibration-target-peak", config.DefaultCalibrationTargetPeak, "target robust peak used for audio calibration")
-	calibrationMaxGain := fs.Float64("calibration-max-gain", config.DefaultCalibrationMaxGain, "maximum gain applied during audio calibration")
-	calibrationMaxSamples := fs.Int("calibration-max-samples", config.DefaultCalibrationMaxMSamples, "maximum sampled points used for calibration peak estimation")
+	fixedScale := fs.Float64("scale", config.DefaultFixedScale, "fixed signal scale factor applied to audio")
 	dataFolder := fs.String("data-folder", "", "path to model directory")
 	debug := fs.Bool("debug", false, "show detailed debug logs")
 	showVersion := fs.Bool("version", false, "show version")
@@ -162,25 +149,21 @@ func parseCLI(args []string) (cliOptions, error) {
 	}
 
 	opts := cliOptions{
-		ListenAddr:             *listenAddr,
-		Workers:                *workers,
-		NumThreads:             *numThreads,
-		MaxUploadMB:            *maxUploadMB,
-		Format:                 strings.ToLower(*format),
-		ChunkSize:              *chunkSize,
-		ChunkMinTailDuration:   *chunkMinTail,
-		MaxActivePaths:         *maxActivePaths,
-		DecodingMethod:         strings.ToLower(*decodingMethod),
-		NoVAD:                  *noVAD,
-		VADThreshold:           *vadThreshold,
-		VADMinSilenceDuration:  *vadMinSilence,
-		VADMinSpeechDuration:   *vadMinSpeech,
-		CalibrationTargetPeak:  *calibrationTargetPeak,
-		CalibrationMaxGain:     *calibrationMaxGain,
-		CalibrationMaxMSamples: *calibrationMaxSamples,
-		DataFolder:             *dataFolder,
-		Debug:                  *debug,
-		ShowVersion:            *showVersion,
+		ListenAddr:           *listenAddr,
+		Workers:              *workers,
+		NumThreads:           *numThreads,
+		MaxUploadMB:          *maxUploadMB,
+		Format:               strings.ToLower(*format),
+		ChunkSize:            *chunkSize,
+		ChunkOverlapDuration: *chunkOverlap,
+		ChunkMinTailDuration: *chunkMinTail,
+		MaxActivePaths:       *maxActivePaths,
+		DecodingMethod:       strings.ToLower(*decodingMethod),
+		NoVAD:                true,
+		FixedScale:           *fixedScale,
+		DataFolder:           *dataFolder,
+		Debug:                *debug,
+		ShowVersion:          *showVersion,
 	}
 
 	if opts.ShowVersion {
@@ -199,23 +182,11 @@ func parseCLI(args []string) (cliOptions, error) {
 	if opts.ChunkMinTailDuration < 0 {
 		return cliOptions{}, fmt.Errorf("%w: chunk-min-tail must be >= 0", errInvalidArgs)
 	}
-	if opts.VADThreshold <= 0 {
-		return cliOptions{}, fmt.Errorf("%w: vad-threshold must be > 0", errInvalidArgs)
+	if opts.ChunkOverlapDuration < 0 {
+		return cliOptions{}, fmt.Errorf("%w: chunk-overlap must be >= 0", errInvalidArgs)
 	}
-	if opts.VADMinSilenceDuration <= 0 {
-		return cliOptions{}, fmt.Errorf("%w: vad-min-silence must be > 0", errInvalidArgs)
-	}
-	if opts.VADMinSpeechDuration <= 0 {
-		return cliOptions{}, fmt.Errorf("%w: vad-min-speech must be > 0", errInvalidArgs)
-	}
-	if opts.CalibrationTargetPeak <= 0 {
-		return cliOptions{}, fmt.Errorf("%w: calibration-target-peak must be > 0", errInvalidArgs)
-	}
-	if opts.CalibrationMaxGain <= 0 {
-		return cliOptions{}, fmt.Errorf("%w: calibration-max-gain must be > 0", errInvalidArgs)
-	}
-	if opts.CalibrationMaxMSamples <= 0 {
-		return cliOptions{}, fmt.Errorf("%w: calibration-max-samples must be > 0", errInvalidArgs)
+	if opts.FixedScale <= 0 {
+		return cliOptions{}, fmt.Errorf("%w: scale must be > 0", errInvalidArgs)
 	}
 
 	switch opts.DecodingMethod {
@@ -229,13 +200,11 @@ func parseCLI(args []string) (cliOptions, error) {
 
 func recognizerConfigFromCLI(opts cliOptions, modelPath string) *config.ASR {
 	return &config.ASR{
-		ModelPath:              modelPath,
-		NumThreads:             opts.NumThreads,
-		DecodingMethod:         opts.DecodingMethod,
-		MaxActivePaths:         opts.MaxActivePaths,
-		CalibrationTargetPeak:  float32(opts.CalibrationTargetPeak),
-		CalibrationMaxGain:     float32(opts.CalibrationMaxGain),
-		CalibrationMaxMSamples: opts.CalibrationMaxMSamples,
+		ModelPath:      modelPath,
+		NumThreads:     opts.NumThreads,
+		DecodingMethod: opts.DecodingMethod,
+		MaxActivePaths: opts.MaxActivePaths,
+		FixedScale:     float32(opts.FixedScale),
 	}
 }
 

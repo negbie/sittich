@@ -19,39 +19,9 @@ const (
 	DecoderFile = "decoder.int8.onnx"
 	JoinerFile  = "joiner.int8.onnx"
 	TokensFile  = "tokens.txt"
-
-	VADModelName = "silero-vad"
-	VADModelURL  = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx"
-	VADFile      = "silero_vad.onnx"
 )
 
 var requiredModelFiles = []string{EncoderFile, DecoderFile, JoinerFile, TokensFile}
-
-// GetVADPath returns the path to the VAD model file, downloading if necessary.
-// If dataDir is empty, it defaults to "./data".
-func GetVADPath(dataDir string) (string, error) {
-	if dataDir == "" {
-		dataDir = "./data"
-	}
-
-	vadDir := filepath.Join(dataDir, VADModelName)
-	vadPath := filepath.Join(vadDir, VADFile)
-
-	if _, err := os.Stat(vadPath); err == nil {
-		return vadPath, nil
-	}
-
-	fmt.Fprintf(os.Stderr, "Downloading VAD model to %s...\n", vadPath)
-	if err := os.MkdirAll(vadDir, 0755); err != nil {
-		return "", err
-	}
-
-	if err := downloadFile(VADModelURL, vadPath); err != nil {
-		return "", fmt.Errorf("failed to download VAD model: %w", err)
-	}
-
-	return vadPath, nil
-}
 
 // downloadFile downloads a single file from url to path
 func downloadFile(url, path string) error {

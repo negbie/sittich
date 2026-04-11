@@ -8,6 +8,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/negbie/sittich/internal/asr"
 	"github.com/negbie/sittich/internal/config"
 	"github.com/negbie/sittich/internal/server"
 	"github.com/negbie/sittich/internal/worker"
@@ -29,6 +30,10 @@ func runServer(opts *cliOptions) error {
 	defer recognizer.Close()
 	fmt.Fprintln(os.Stderr, "Model loaded!   ")
 
+	// Global ASR Dispatcher with 4 workers and 20ms batch window (Parallel Batching mode)
+	dispatcher := asr.NewDispatcher(recognizer, 4, 16, 20*time.Millisecond, opts.Debug)
+	defer dispatcher.Close()
+
 	// Create worker pool
 	serverCfg := &config.Server{
 		ListenAddr:   opts.ListenAddr,
@@ -40,16 +45,13 @@ func runServer(opts *cliOptions) error {
 	pool := worker.NewPool(
 		opts.Workers,
 		config.DefaultMaxQueueSize,
-		recognizer,
+		dispatcher,
 		config.Pipeline{
-			VADEnabled:            !opts.NoVAD,
-			ChunkDuration:         float64(opts.ChunkSize),
-			ChunkMinTailDuration:  opts.ChunkMinTailDuration,
-			VADThreshold:          float32(opts.VADThreshold),
-			VADMinSilenceDuration: float32(opts.VADMinSilenceDuration),
-			VADMinSpeechDuration:  float32(opts.VADMinSpeechDuration),
-			NumThreads:             opts.NumThreads,
-			Debug:                  opts.Debug,
+			ChunkDuration:        float64(opts.ChunkSize),
+			ChunkOverlapDuration: opts.ChunkOverlapDuration,
+			ChunkMinTailDuration: opts.ChunkMinTailDuration,
+			WordTimestamps:       true,
+			Debug:                opts.Debug,
 		},
 		opts.Debug,
 		opts.DataFolder,

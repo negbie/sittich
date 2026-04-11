@@ -46,21 +46,39 @@ func NewVAD(modelPath string, threshold, minSilenceDuration, minSpeechDuration f
 
 // DetectSpeech runs a Silero VAD detector over the provided 16 kHz mono audio.
 func (v *VAD) DetectSpeech(audioSamples []float32, sampleRate int) ([]SpeechSegment, error) {
+	results := make(chan SpeechSegment, 10)
+	errChan := make(chan error, 1)
+
+	go func() {
+		errChan <- v.DetectSpeechStream(audioSamples, sampleRate, results)
+		close(results)
+	}()
+
+	var segments []SpeechSegment
+	for seg := range results {
+		segments = append(segments, seg)
+	}
+
+	return segments, <-errChan
+}
+
+// DetectSpeechStream runs VAD and emits finalized segments to the results channel.
+func (v *VAD) DetectSpeechStream(audioSamples []float32, sampleRate int, results chan<- SpeechSegment) error {
 	targetRate := int(v.config.SampleRate)
 	if sampleRate != targetRate {
-		return nil, fmt.Errorf("vad: expected %d Hz audio, got %d Hz", targetRate, sampleRate)
+		return fmt.Errorf("vad: expected %d Hz audio, got %d Hz", targetRate, sampleRate)
 	}
 
 	v.mu.Lock()
 	if v.closed {
 		v.mu.Unlock()
-		return nil, fmt.Errorf("vad: detector is closed")
+		return fmt.Errorf("vad: detector is closed")
 	}
 	v.mu.Unlock()
 
 	detector := sherpa.NewVoiceActivityDetector(&v.config, 30.0)
 	if detector == nil {
-		return nil, fmt.Errorf("vad: failed to create detector")
+		return fmt.Errorf("vad: failed to create detector")
 	}
 	defer sherpa.DeleteVoiceActivityDetector(detector)
 
@@ -69,52 +87,51 @@ func (v *VAD) DetectSpeech(audioSamples []float32, sampleRate int) ([]SpeechSegm
 		windowSize = 512
 	}
 
-	// 2. Feed audio in windows
+	totalSamples := len(audioSamples)
+	emit := func() {
+		for !detector.IsEmpty() {
+			seg := detector.Front()
+			detector.Pop()
+
+			startSample := seg.Start
+			if startSample < 0 {
+				startSample = 0
+			}
+			if startSample > totalSamples {
+				startSample = totalSamples
+			}
+
+			endSample := seg.Start + len(seg.Samples)
+			if endSample < startSample {
+				endSample = startSample
+			}
+			if endSample > totalSamples {
+				endSample = totalSamples
+			}
+
+			results <- SpeechSegment{
+				Start: float64(startSample) / float64(sampleRate),
+				End:   float64(endSample) / float64(sampleRate),
+			}
+		}
+	}
+
+	// 2. Feed audio in windows and check for segments immediately
 	for i := 0; i+windowSize <= len(audioSamples); i += windowSize {
-		window := audioSamples[i : i+windowSize]
-		detector.AcceptWaveform(window)
+		detector.AcceptWaveform(audioSamples[i : i+windowSize])
+		emit()
 	}
 
 	remainder := len(audioSamples) % windowSize
 	if remainder > 0 {
 		detector.AcceptWaveform(audioSamples[len(audioSamples)-remainder:])
+		emit()
 	}
 
 	detector.Flush()
+	emit()
 
-	// 3. Extract segments
-	var segments []SpeechSegment
-	totalSamples := len(audioSamples)
-	for !detector.IsEmpty() {
-		seg := detector.Front()
-		detector.Pop()
-
-		startSample := seg.Start
-		if startSample < 0 {
-			startSample = 0
-		}
-		if startSample > totalSamples {
-			startSample = totalSamples
-		}
-
-		endSample := seg.Start + len(seg.Samples)
-		if endSample < startSample {
-			endSample = startSample
-		}
-		if endSample > totalSamples {
-			endSample = totalSamples
-		}
-
-		startSec := float64(startSample) / float64(sampleRate)
-		endSec := float64(endSample) / float64(sampleRate)
-
-		segments = append(segments, SpeechSegment{
-			Start: startSec,
-			End:   endSec,
-		})
-	}
-
-	return segments, nil
+	return nil
 }
 
 // Close marks the VAD as closed.
