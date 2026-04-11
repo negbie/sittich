@@ -5,11 +5,14 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
 	"github.com/negbie/sittich/internal/asr"
 	"github.com/negbie/sittich/internal/config"
+	"github.com/negbie/sittich/internal/models"
+	"github.com/negbie/sittich/internal/pipeline"
 	"github.com/negbie/sittich/internal/server"
 	"github.com/negbie/sittich/internal/worker"
 )
@@ -20,7 +23,13 @@ func runServer(opts *cliOptions) error {
 	defer showCursor()
 
 	fmt.Fprint(os.Stderr, "Loading model...\r")
-	cfg := recognizerConfigFromCLI(*opts, opts.DataFolder)
+	actualDataFolder, err := models.GetModelPath(opts.DataFolder)
+	if err != nil {
+		fmt.Fprintln(os.Stderr)
+		return err
+	}
+
+	cfg := recognizerConfigFromCLI(*opts, actualDataFolder)
 
 	recognizer, err := server.LoadRecognizer(cfg)
 	if err != nil {
@@ -31,29 +40,57 @@ func runServer(opts *cliOptions) error {
 	fmt.Fprintln(os.Stderr, "Model loaded!   ")
 
 	// Global ASR Dispatcher with 4 workers and 20ms batch window (Parallel Batching mode)
-	dispatcher := asr.NewDispatcher(recognizer, 4, 16, 20*time.Millisecond, opts.Debug)
+	dispatcher := asr.NewDispatcher(recognizer, 4, 16, 5*time.Millisecond, opts.Debug)
 	defer dispatcher.Close()
+
+	// Initialize VAD once (shared)
+	var sharedVAD *pipeline.VAD
+	if opts.UseVAD {
+		if err := models.EnsureVAD(actualDataFolder); err != nil {
+			fmt.Fprintf(os.Stderr, "   VAD download error: %v, falling back to blind chunking\n", err)
+		} else {
+			vadModelPath := filepath.Join(actualDataFolder, models.VADModelFile)
+			sharedVAD, err = pipeline.NewVAD(
+				vadModelPath,
+				float32(opts.VADThreshold),
+				float32(opts.VADMinSilence),
+				float32(opts.VADMinSpeech),
+				1,
+			)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "   VAD error: %v, falling back to blind chunking\n", err)
+			} else {
+				defer sharedVAD.Close()
+			}
+		}
+	}
 
 	// Create worker pool
 	serverCfg := &config.Server{
 		ListenAddr:   opts.ListenAddr,
 		MaxUploadMB:  int64(opts.MaxUploadMB),
 		Workers:      opts.Workers,
-		MaxQueueSize: config.DefaultMaxQueueSize,
+		MaxQueueSize: 10,
 		Debug:        opts.Debug,
 	}
 	pool := worker.NewPool(
 		opts.Workers,
-		config.DefaultMaxQueueSize,
+		10,
 		dispatcher,
 		config.Pipeline{
-			ChunkDuration:        float64(opts.ChunkSize),
-			ChunkOverlapDuration: opts.ChunkOverlapDuration,
-			WordTimestamps:       true,
-			Debug:                opts.Debug,
+			ChunkDuration:         float64(opts.ChunkSize),
+			ChunkOverlapDuration:  opts.ChunkOverlapDuration,
+			WordTimestamps:        true,
+			Debug:                 opts.Debug,
+			UseVAD:                opts.UseVAD,
+			VADModelPath:          filepath.Join(actualDataFolder, models.VADModelFile),
+			VADThreshold:          float32(opts.VADThreshold),
+			VADMinSilenceDuration: float32(opts.VADMinSilence),
+			VADMinSpeechDuration:  float32(opts.VADMinSpeech),
 		},
 		opts.Debug,
-		opts.DataFolder,
+		actualDataFolder,
+		sharedVAD,
 	)
 	defer pool.Shutdown()
 

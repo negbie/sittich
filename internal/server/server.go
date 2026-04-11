@@ -178,11 +178,11 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 func (s *Server) parseRequest(r *http.Request) (filePath, format string, chunkSize int, cleanup func(), err error) {
 	format = s.options.DefaultFormat
 	if format == "" {
-		format = config.DefaultFormat
+		format = "text"
 	}
 	chunkSize = s.options.DefaultChunkSize
 	if chunkSize <= 0 {
-		chunkSize = config.DefaultChunkSize
+		chunkSize = 40
 	}
 
 	contentType := r.Header.Get("Content-Type")

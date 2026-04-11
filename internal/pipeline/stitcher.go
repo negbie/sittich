@@ -1,8 +1,6 @@
 package pipeline
 
 import (
-	"fmt"
-	"os"
 	"strings"
 
 	"github.com/negbie/sittich/internal/speech"
@@ -56,6 +54,7 @@ func StitchResults(chunks []ChunkResult) *speech.Result {
 
 	// 2. Merge chunks sequentially
 	allWords := make([]speech.Word, 0)
+	var prevOrigEnd float64
 	for i, cr := range chunks {
 		if cr.Result == nil || len(cr.Result.Segments) == 0 {
 			continue
@@ -66,13 +65,14 @@ func StitchResults(chunks []ChunkResult) *speech.Result {
 			chunkWords = append(chunkWords, seg.Words...)
 		}
 
-		// Bug #3: Trim words whose midpoint falls outside [OrigStart, OrigEnd]
 		// The padding region is for context only; its transcription shouldn't leak.
 		if cr.OrigEnd > cr.OrigStart {
 			filtered := make([]speech.Word, 0, len(chunkWords))
 			for _, w := range chunkWords {
 				mid := w.Start + (w.End-w.Start)/2
-				if mid >= cr.OrigStart && mid <= cr.OrigEnd {
+				// Important: Use strictly less than (<) for OrigEnd to ensure a word
+				// with its midpoint exactly on the boundary is not duplicated.
+				if mid >= cr.OrigStart && mid < cr.OrigEnd {
 					filtered = append(filtered, w)
 				}
 			}
@@ -85,12 +85,14 @@ func StitchResults(chunks []ChunkResult) *speech.Result {
 
 		if i == 0 {
 			allWords = append(allWords, chunkWords...)
+			prevOrigEnd = cr.OrigEnd
 			continue
 		}
 
 		// Handle overlap with the words already in allWords
 		if len(allWords) == 0 {
 			allWords = append(allWords, chunkWords...)
+			prevOrigEnd = cr.OrigEnd
 			continue
 		}
 
@@ -99,11 +101,9 @@ func StitchResults(chunks []ChunkResult) *speech.Result {
 		lastTokenGlobalEnd := allWords[len(allWords)-1].End
 		overlapStart := chunkWords[0].Start
 
-		if overlapStart >= lastTokenGlobalEnd {
-			// No temporal overlap, just append. This is the expected fast-path
-			// when using a deterministic native decoder + sequential chunks.
-			fmt.Fprintf(os.Stderr, "   [Stitcher] Stage simple_append offset=%.2f\n", cr.Offset)
+		if overlapStart >= lastTokenGlobalEnd || cr.OrigStart >= prevOrigEnd {
 			allWords = append(allWords, chunkWords...)
+			prevOrigEnd = cr.OrigEnd
 			continue
 		}
 
@@ -168,17 +168,17 @@ func StitchResults(chunks []ChunkResult) *speech.Result {
 		if idxB+1 < len(chunkWords) {
 			allWords = append(allWords, chunkWords[idxB+1:]...)
 		}
+
+		prevOrigEnd = cr.OrigEnd
 	}
 
 	// 3. Rebuild segments from merged words
-	// For now, we put everything into one segment per result or try to keep them.
-	// Simple approach: one global segment.
-	resText := ""
+	var b strings.Builder
+	b.Grow(len(allWords) * 6)
 	for _, w := range allWords {
-		resText += w.Word
+		b.WriteString(w.Word)
 	}
-	resText = strings.ReplaceAll(resText, " ", " ")
-	resText = strings.TrimSpace(resText)
+	resText := strings.TrimSpace(b.String())
 
 	combined.Segments = []speech.Segment{
 		{

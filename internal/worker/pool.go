@@ -27,20 +27,22 @@ type Pool struct {
 	busyCount    atomic.Int32
 	debug        bool
 	shutdownOnce sync.Once
+	vad          *pipeline.VAD
 }
 
 // NewPool creates a new worker pool
-func NewPool(workers int, queueSize int, engine speech.Engine, cfg config.Pipeline, debug bool, dataDir string) *Pool {
+func NewPool(workers int, queueSize int, engine speech.Engine, cfg config.Pipeline, debug bool, dataDir string, vad *pipeline.VAD) *Pool {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	p := &Pool{
-		workers:    workers,
-		queue:      make(chan *Job, queueSize),
-		engine:     engine,
+		workers:     workers,
+		queue:       make(chan *Job, queueSize),
+		engine:      engine,
 		pipelineCfg: cfg,
-		ctx:    ctx,
-		cancel: cancel,
-		debug:  debug,
+		ctx:         ctx,
+		cancel:      cancel,
+		debug:       debug,
+		vad:         vad,
 	}
 
 	// Start workers
@@ -94,8 +96,8 @@ func (p *Pool) Shutdown() {
 func (p *Pool) worker(id int) {
 	defer p.wg.Done()
 
-	// 1. Initialise a private Pipeline for this worker.
-	pipe, err := pipeline.NewPipeline(p.engine, p.pipelineCfg)
+	// 1. Initialise a private Pipeline for this worker with the shared VAD.
+	pipe, err := pipeline.NewPipeline(p.engine, p.pipelineCfg, p.vad)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Worker %d: failed to initialise pipeline: %v\n", id, err)
 		return

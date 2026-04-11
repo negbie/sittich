@@ -3,20 +3,9 @@ package audio
 import (
 	"encoding/binary"
 	"fmt"
-	"io"
 	"log/slog"
 	"math"
 )
-
-// DecodeNative parses a WAV file from an io.Reader and returns float32 samples normalized to [-1, 1].
-// It handles standard PCM (16/24/32-bit) and IEEE Float (32-bit).
-func DecodeNative(r io.Reader) ([]float32, error) {
-	data, err := io.ReadAll(r)
-	if err != nil {
-		return nil, fmt.Errorf("read wav: %w", err)
-	}
-	return parseWAV(data)
-}
 
 // parseWAV parses a WAV file from a byte slice.
 func parseWAV(data []byte) ([]float32, error) {

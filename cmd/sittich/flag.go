@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"strconv"
 	"strings"
 	"unicode/utf8"
 
@@ -29,24 +28,23 @@ var (
 	errInvalidArgs = errors.New("invalid arguments")
 )
 
-
-
 type cliOptions struct {
-	ListenAddr             string
-	ChunkSize              int
-	ChunkOverlapDuration   float64
-	Format                 string
-	MaxActivePaths         int
-	DecodingMethod         string
-	NoVAD                  bool
-	VADMinSpeechDuration   float64
-	FixedScale             float64
-	DataFolder             string
-	Workers                int
-	NumThreads             int
-	MaxUploadMB            int
-	Debug                  bool
-	ShowVersion            bool
+	ListenAddr           string
+	ChunkSize            int
+	ChunkOverlapDuration float64
+	Format               string
+	MaxActivePaths       int
+	DecodingMethod       string
+	UseVAD               bool
+	VADThreshold         float64
+	VADMinSilence        float64
+	VADMinSpeech         float64
+	DataFolder           string
+	Workers              int
+	NumThreads           int
+	MaxUploadMB          int
+	Debug                bool
+	ShowVersion          bool
 }
 
 type cliFlag struct {
@@ -64,15 +62,18 @@ type usageRow struct {
 }
 
 var allFlags = []cliFlag{
-	{long: "listen", arg: "address", description: "listen address", defaultVal: config.DefaultListenAddr},
-	{long: "workers", arg: "int", description: "concurrent workers", defaultVal: strconv.Itoa(config.DefaultWorkers)},
-	{long: "num-threads", arg: "int", description: "number of threads for recognizer and VAD", defaultVal: strconv.Itoa(config.DefaultNumThreads)},
-	{long: "max-upload", arg: "int", description: "max upload size in MB", defaultVal: strconv.Itoa(config.DefaultMaxUploadMB)},
-	{long: "format", arg: "string", description: "default output format: text, json, vtt", defaultVal: config.DefaultFormat},
-	{long: "chunk-size", arg: "int", description: "default chunk size in seconds", defaultVal: strconv.Itoa(config.DefaultChunkSize)},
-	{long: "chunk-overlap", arg: "float", description: "overlap duration between chunks in seconds", defaultVal: strconv.FormatFloat(config.DefaultChunkOverlap, 'f', 1, 64)},
+	{long: "listen", arg: "address", description: "listen address", defaultVal: ":5092"},
+	{long: "workers", arg: "int", description: "concurrent workers", defaultVal: "4"},
+	{long: "num-threads", arg: "int", description: "number of threads for recognizer and VAD", defaultVal: "2"},
+	{long: "max-upload", arg: "int", description: "max upload size in MB", defaultVal: "16"},
+	{long: "format", arg: "string", description: "default output format: text, json, vtt", defaultVal: "text"},
+	{long: "chunk-size", arg: "int", description: "default chunk size in seconds", defaultVal: "40"},
+	{long: "chunk-overlap", arg: "float", description: "overlap duration between chunks in seconds", defaultVal: "0.4"},
+	{long: "use-vad", description: "use voice activity detection for chunking"},
+	{long: "vad-threshold", arg: "float", description: "VAD probability threshold (0.0 to 1.0)", defaultVal: "0.5"},
+	{long: "vad-min-silence", arg: "float", description: "VAD minimum silence duration in seconds", defaultVal: "0.2"},
+	{long: "vad-min-speech", arg: "float", description: "VAD minimum speech duration in seconds", defaultVal: "0.2"},
 	{long: "debug", description: "show detailed debug logs"},
-	{long: "scale", arg: "float", description: "fixed signal scale factor applied to audio", defaultVal: strconv.FormatFloat(config.DefaultFixedScale, 'f', 1, 64)},
 	{long: "data-folder", arg: "path", description: "path to model directory"},
 	{long: "version", description: "show version"},
 }
@@ -118,16 +119,19 @@ func parseCLI(args []string) (cliOptions, error) {
 	fs := flag.NewFlagSet("sittich", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 
-	listenAddr := fs.String("listen", config.DefaultListenAddr, "listen address")
-	workers := fs.Int("workers", config.DefaultWorkers, "concurrent workers")
-	numThreads := fs.Int("num-threads", config.DefaultNumThreads, "number of threads for recognizer and VAD")
-	maxUploadMB := fs.Int("max-upload", config.DefaultMaxUploadMB, "max upload size in MB")
-	format := fs.String("format", config.DefaultFormat, "default output format (text, json, vtt)")
-	chunkSize := fs.Int("chunk-size", config.DefaultChunkSize, "default chunk size in seconds")
-	chunkOverlap := fs.Float64("chunk-overlap", config.DefaultChunkOverlap, "overlap duration between adjacent chunks in seconds")
-	maxActivePaths := fs.Int("max-active-paths", config.DefaultMaxActivePaths, "number of active paths for modified beam search")
-	decodingMethod := fs.String("decoding-method", config.DefaultDecodingMethod, "decoding method: greedy_search or modified_beam_search")
-	fixedScale := fs.Float64("scale", config.DefaultFixedScale, "fixed signal scale factor applied to audio")
+	listenAddr := fs.String("listen", ":5092", "listen address")
+	workers := fs.Int("workers", 4, "concurrent workers")
+	numThreads := fs.Int("num-threads", 2, "number of threads for recognizer and VAD")
+	maxUploadMB := fs.Int("max-upload", 16, "max upload size in MB")
+	format := fs.String("format", "text", "default output format (text, json, vtt)")
+	chunkSize := fs.Int("chunk-size", 40, "default chunk size in seconds")
+	chunkOverlap := fs.Float64("chunk-overlap", 0.4, "overlap duration between adjacent chunks in seconds")
+	maxActivePaths := fs.Int("max-active-paths", 4, "number of active paths for modified beam search")
+	decodingMethod := fs.String("decoding-method", "modified_beam_search", "decoding method: greedy_search or modified_beam_search")
+	useVAD := fs.Bool("use-vad", false, "use voice activity detection for chunking")
+	vadThreshold := fs.Float64("vad-threshold", 0.5, "VAD probability threshold (0.0 to 1.0)")
+	vadMinSilence := fs.Float64("vad-min-silence", 0.2, "VAD minimum silence duration in seconds")
+	vadMinSpeech := fs.Float64("vad-min-speech", 0.2, "VAD minimum speech duration in seconds")
 	dataFolder := fs.String("data-folder", "", "path to model directory")
 	debug := fs.Bool("debug", false, "show detailed debug logs")
 	showVersion := fs.Bool("version", false, "show version")
@@ -153,8 +157,10 @@ func parseCLI(args []string) (cliOptions, error) {
 		ChunkOverlapDuration: *chunkOverlap,
 		MaxActivePaths:       *maxActivePaths,
 		DecodingMethod:       strings.ToLower(*decodingMethod),
-		NoVAD:                true,
-		FixedScale:           *fixedScale,
+		UseVAD:               *useVAD,
+		VADThreshold:         *vadThreshold,
+		VADMinSilence:        *vadMinSilence,
+		VADMinSpeech:         *vadMinSpeech,
 		DataFolder:           *dataFolder,
 		Debug:                *debug,
 		ShowVersion:          *showVersion,
@@ -176,8 +182,8 @@ func parseCLI(args []string) (cliOptions, error) {
 	if opts.ChunkOverlapDuration < 0 {
 		return cliOptions{}, fmt.Errorf("%w: chunk-overlap must be >= 0", errInvalidArgs)
 	}
-	if opts.FixedScale <= 0 {
-		return cliOptions{}, fmt.Errorf("%w: scale must be > 0", errInvalidArgs)
+	if opts.VADThreshold < 0 || opts.VADThreshold > 1 {
+		return cliOptions{}, fmt.Errorf("%w: vad-threshold must be between 0 and 1", errInvalidArgs)
 	}
 
 	switch opts.DecodingMethod {
@@ -195,7 +201,6 @@ func recognizerConfigFromCLI(opts cliOptions, modelPath string) *config.ASR {
 		NumThreads:     opts.NumThreads,
 		DecodingMethod: opts.DecodingMethod,
 		MaxActivePaths: opts.MaxActivePaths,
-		FixedScale:     float32(opts.FixedScale),
 	}
 }
 

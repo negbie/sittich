@@ -23,6 +23,7 @@ type Pipeline struct {
 	engine speech.Engine
 	config config.Pipeline
 	ready  atomic.Bool
+	vad    *VAD
 }
 
 // New creates a Pipeline that delegates transcription to the given engine.
@@ -37,10 +38,11 @@ func New(eng speech.Engine) *Pipeline {
 }
 
 // NewPipeline creates a fully configured Pipeline.
-func NewPipeline(eng speech.Engine, cfg config.Pipeline) (*Pipeline, error) {
+func NewPipeline(eng speech.Engine, cfg config.Pipeline, vad *VAD) (*Pipeline, error) {
 	p := &Pipeline{
 		engine: eng,
 		config: cfg,
+		vad:    vad,
 	}
 
 	if eng != nil {
@@ -66,6 +68,7 @@ func (p *Pipeline) ModelName() string {
 // Close releases resources held by the pipeline.
 func (p *Pipeline) Close() error {
 	p.ready.Store(false)
+	// Note: p.vad is a shared resource owned by the caller; do not close it here.
 	return nil
 }
 
@@ -123,6 +126,7 @@ func (p *Pipeline) ProcessAudio(ctx context.Context, samples []float32, sampleRa
 func (p *Pipeline) processAudioInternal(ctx context.Context, samples []float32, sampleRate int, channels int, opts speech.Options, chunkDuration float64) (*speech.Result, error) {
 	const targetRate = 16000
 	overlap := p.config.ChunkOverlapDuration
+
 	padding := 0.30 // 300ms floor for context
 	if overlap > 0 {
 		// Optimization: Scale context padding with overlap to provide better anchors for the stitcher.
@@ -135,59 +139,132 @@ func (p *Pipeline) processAudioInternal(ctx context.Context, samples []float32, 
 
 	totalStart := time.Now()
 
-	// Audit signal quality
-	p.verifySignal(samples, targetRate)
+	if p.config.Debug {
+		fmt.Fprint(os.Stderr, "   [Pipeline] Stage signal_processed")
+		p.verifySignal(samples, targetRate)
+	}
+
 	resampled := samples
 
 	// 1. Tiling & Chunking
 	totalDur := float64(len(resampled)) / float64(targetRate)
 	var chunks []Chunk
-	step := chunkDuration - overlap
-	if step <= 0 {
-		step = chunkDuration
+
+	doBlindChunking := func() {
+		step := chunkDuration - overlap
+		if step <= 0 {
+			step = chunkDuration
+		}
+
+		for start := 0.0; start < totalDur; {
+			origStart := start
+			origEnd := start + chunkDuration
+			if origEnd > totalDur {
+				origEnd = totalDur
+			}
+
+			chunkStart := origStart - padding
+			if chunkStart < 0 {
+				chunkStart = 0
+			}
+			chunkEnd := origEnd + padding
+			if chunkEnd > totalDur {
+				chunkEnd = totalDur
+			}
+
+			chunks = append(chunks, Chunk{
+				Start:     chunkStart,
+				End:       chunkEnd,
+				OrigStart: origStart,
+				OrigEnd:   origEnd,
+			})
+
+			if overlap >= chunkDuration || origEnd >= totalDur {
+				start = origEnd
+			} else {
+				start += step
+			}
+		}
 	}
 
-	for start := 0.0; start < totalDur; {
-		origStart := start
-		origEnd := start + chunkDuration
-		if origEnd > totalDur {
-			origEnd = totalDur
-		}
-
-		chunkStart := origStart - padding
-		if chunkStart < 0 {
-			chunkStart = 0
-		}
-		chunkEnd := origEnd + padding
-		if chunkEnd > totalDur {
-			chunkEnd = totalDur
-		}
-
-		chunks = append(chunks, Chunk{
-			Start:     chunkStart,
-			End:       chunkEnd,
-			OrigStart: origStart,
-			OrigEnd:   origEnd,
-		})
-
-		if overlap >= chunkDuration || origEnd >= totalDur {
-			start = origEnd
+	if p.vad != nil {
+		segments, err := p.vad.DetectSpeech(resampled, targetRate)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "VAD error: %v, falling back to blind chunking\n", err)
+			doBlindChunking()
 		} else {
-			start += step
+			chunks = ChunkSpeechSegments(resampled, targetRate, segments, chunkDuration, overlap)
+			if len(chunks) == 0 { // No speech detected
+				return &speech.Result{Duration: totalDur}, nil
+			}
+
+			// Add padding to chunks to ensure context
+			for i := range chunks {
+				// Physical audio bounds (padding for engine acoustic context)
+				chunks[i].Start -= padding
+				if chunks[i].Start < 0 {
+					chunks[i].Start = 0
+				}
+				chunks[i].End += padding
+				if chunks[i].End > totalDur {
+					chunks[i].End = totalDur
+				}
+
+				// Logical transcription bounds (OrigStart/OrigEnd)
+				// VAD tightly bounds speech. We expand the logical bounds into the
+				// surrounding silence (if any) to authorize edge words captured by the padding.
+				origStartExpand := chunks[i].OrigStart - padding
+				if i > 0 {
+					gap := chunks[i].OrigStart - chunks[i-1].OrigEnd
+					if gap > 0 {
+						// There is a silence gap. Limit expansion to halfway across the gap.
+						midpoint := chunks[i-1].OrigEnd + gap/2
+						if origStartExpand < midpoint {
+							origStartExpand = midpoint
+						}
+					} else {
+						// Oversized chunk split. Prevent OrigStart from expanding backwards
+						// to maintain strict deduplication bounds for the stitcher.
+						origStartExpand = chunks[i].OrigStart
+					}
+				}
+				if origStartExpand < 0 {
+					origStartExpand = 0
+				}
+				chunks[i].OrigStart = origStartExpand
+
+				origEndExpand := chunks[i].OrigEnd + padding
+				if i < len(chunks)-1 {
+					gap := chunks[i+1].OrigStart - chunks[i].OrigEnd
+					if gap > 0 {
+						midpoint := chunks[i].OrigEnd + gap/2
+						if origEndExpand > midpoint {
+							origEndExpand = midpoint
+						}
+					} else {
+						origEndExpand = chunks[i].OrigEnd
+					}
+				}
+				if origEndExpand > totalDur {
+					origEndExpand = totalDur
+				}
+				chunks[i].OrigEnd = origEndExpand
+			}
 		}
+	} else {
+		doBlindChunking()
 	}
 
-	// 2. Unitary Request Batch Submit
-	// Instead of trickling chunks through workers, we submit the entire request
-	// as one batch. This allows the Global Dispatcher and the underlying engine
-	// to optimize the hardware utilization far more effectively.
 	allChunkResults, err := p.transcribeChunks(ctx, resampled, targetRate, chunks, opts)
 	if err != nil {
 		return nil, err
 	}
 
+	// Release the decoded audio so the GC can reclaim it during stitching.
+	resampled = nil
+
 	if len(allChunkResults) == 0 {
-		return &speech.Result{Duration: float64(len(resampled)) / targetRate}, nil
+		return &speech.Result{Duration: totalDur}, nil
 	}
 
 	// Ensure results are sorted by offset for stitching
@@ -196,7 +273,7 @@ func (p *Pipeline) processAudioInternal(ctx context.Context, samples []float32, 
 	})
 
 	combined := StitchResults(allChunkResults)
-	combined.Duration = float64(len(resampled)) / targetRate
+	combined.Duration = totalDur
 
 	for i := range combined.Segments {
 		combined.Segments[i].Text = strings.TrimSpace(combined.Segments[i].Text)
@@ -207,13 +284,6 @@ func (p *Pipeline) processAudioInternal(ctx context.Context, samples []float32, 
 	}
 
 	return combined, nil
-}
-
-func (p *Pipeline) decodeAndResample(_ []float32, _ int, _ int, targetRate int) ([]float32, error) {
-	// The new DecodeWAV engine (via Sox) already returns 16kHz Mono samples.
-	// We keep this stage only for debug peak logging and signal verification.
-	// The incoming 'samples' are already 16kHz Mono.
-	return nil, fmt.Errorf("pipeline: internal logic error, raw samples should not be passed to decodeAndResample anymore")
 }
 
 // verifySignal checks the signal amplitude and logs the peak for debugging.
@@ -236,8 +306,9 @@ func (p *Pipeline) transcribeChunks(ctx context.Context, resampled []float32, ta
 
 	batch := make([][]float32, 0, len(chunks))
 	offsets := make([]float64, 0, len(chunks))
+	validIndices := make([]int, 0, len(chunks))
 
-	for _, c := range chunks {
+	for ci, c := range chunks {
 		startSample := int(c.Start * float64(targetRate))
 		endSample := int(c.End * float64(targetRate))
 		if startSample < 0 {
@@ -251,13 +322,11 @@ func (p *Pipeline) transcribeChunks(ctx context.Context, resampled []float32, ta
 			continue
 		}
 
-		// Bug #1: Copy the chunk audio instead of slicing to avoid in-place
-		// calibration corrupting shared memory.
 		chunkAudio := make([]float32, endSample-startSample)
 		copy(chunkAudio, resampled[startSample:endSample])
-
 		batch = append(batch, chunkAudio)
 		offsets = append(offsets, c.Start)
+		validIndices = append(validIndices, ci)
 	}
 
 	if len(batch) == 0 {
@@ -275,10 +344,11 @@ func (p *Pipeline) transcribeChunks(ctx context.Context, resampled []float32, ta
 
 	chunkResults := make([]ChunkResult, len(results))
 	for i, res := range results {
+		ci := validIndices[i]
 		chunkResults[i] = ChunkResult{
 			Offset:    offsets[i],
-			OrigStart: chunks[i].OrigStart,
-			OrigEnd:   chunks[i].OrigEnd,
+			OrigStart: chunks[ci].OrigStart,
+			OrigEnd:   chunks[ci].OrigEnd,
 			Result:    res,
 		}
 	}
