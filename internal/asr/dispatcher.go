@@ -14,15 +14,15 @@ import (
 // It satisfies the speech.Engine interface by delegating to an underlying
 // recognizer while aggregating small transcription calls into larger batches.
 type Dispatcher struct {
-	engine     speech.Engine
-	jobChan    chan *asrJob
-	batchSize  int
-	window     time.Duration
-	wg         sync.WaitGroup
-	ctx        context.Context
-	cancel     context.CancelFunc
-	closeOnce  sync.Once
-	debug      bool
+	engine    speech.Engine
+	jobChan   chan *asrJob
+	batchSize int
+	window    time.Duration
+	wg        sync.WaitGroup
+	ctx       context.Context
+	cancel    context.CancelFunc
+	closeOnce sync.Once
+	debug     bool
 }
 
 type asrJob struct {
@@ -81,11 +81,11 @@ func (d *Dispatcher) TranscribeBatch(ctx context.Context, chunks [][]float32, sa
 	}
 
 	type pendingResult struct {
-		ch chan batchResult
+		ch  chan batchResult
 		idx int
 	}
 	pending := make([]pendingResult, n)
-	
+
 	for i, chunk := range chunks {
 		ch := make(chan batchResult, 1)
 		job := &asrJob{

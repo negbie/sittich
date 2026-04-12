@@ -55,7 +55,7 @@ func NewRecognizer(cfg *config.ASR) (*Recognizer, error) {
 	r := &Recognizer{
 		Config:     cfg,
 		recognizer: recognizer,
-		maxActive:  4, // Match dispatcher worker count for full parallelism
+		maxActive:  cfg.MaxActive,
 	}
 	r.cond = sync.NewCond(&r.mu)
 
@@ -126,9 +126,7 @@ func (r *Recognizer) TranscribeBatch(ctx context.Context, chunks [][]float32, sa
 
 		r.mu.Lock()
 		r.active--
-		if r.active == 0 {
-			r.cond.Broadcast()
-		}
+		r.cond.Signal() // wake one waiter per freed slot
 		r.mu.Unlock()
 	}()
 

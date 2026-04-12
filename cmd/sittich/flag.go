@@ -34,6 +34,8 @@ type cliOptions struct {
 	ChunkOverlapDuration float64
 	Format               string
 	MaxActivePaths       int
+	MaxActiveStreams     int
+	MaxQueueSize         int
 	DecodingMethod       string
 	UseVAD               bool
 	VADThreshold         float64
@@ -64,7 +66,9 @@ type usageRow struct {
 var allFlags = []cliFlag{
 	{long: "listen", arg: "address", description: "listen address", defaultVal: ":5092"},
 	{long: "workers", arg: "int", description: "concurrent workers", defaultVal: "4"},
-	{long: "num-threads", arg: "int", description: "number of threads for recognizer and VAD", defaultVal: "2"},
+	{long: "num-threads", arg: "int", description: "ONNX thread pool size per decode stream", defaultVal: "2"},
+	{long: "max-active-streams", arg: "int", description: "max concurrent decode streams", defaultVal: "4"},
+	{long: "max-queue-size", arg: "int", description: "max queued jobs", defaultVal: "12"},
 	{long: "max-upload", arg: "int", description: "max upload size in MB", defaultVal: "16"},
 	{long: "format", arg: "string", description: "default output format: text, json, vtt", defaultVal: "text"},
 	{long: "chunk-size", arg: "int", description: "default chunk size in seconds", defaultVal: "40"},
@@ -121,7 +125,9 @@ func parseCLI(args []string) (cliOptions, error) {
 
 	listenAddr := fs.String("listen", ":5092", "listen address")
 	workers := fs.Int("workers", 4, "concurrent workers")
-	numThreads := fs.Int("num-threads", 2, "number of threads for recognizer and VAD")
+	numThreads := fs.Int("num-threads", 2, "ONNX thread pool size per decode stream")
+	maxActiveStreams := fs.Int("max-active-streams", 4, "max concurrent decode streams")
+	maxQueueSize := fs.Int("max-queue-size", 12, "max queued jobs")
 	maxUploadMB := fs.Int("max-upload", 16, "max upload size in MB")
 	format := fs.String("format", "text", "default output format (text, json, vtt)")
 	chunkSize := fs.Int("chunk-size", 40, "default chunk size in seconds")
@@ -151,6 +157,8 @@ func parseCLI(args []string) (cliOptions, error) {
 		ListenAddr:           *listenAddr,
 		Workers:              *workers,
 		NumThreads:           *numThreads,
+		MaxActiveStreams:     *maxActiveStreams,
+		MaxQueueSize:         *maxQueueSize,
 		MaxUploadMB:          *maxUploadMB,
 		Format:               strings.ToLower(*format),
 		ChunkSize:            *chunkSize,
@@ -196,9 +204,15 @@ func parseCLI(args []string) (cliOptions, error) {
 }
 
 func recognizerConfigFromCLI(opts cliOptions, modelPath string) *config.ASR {
+	maxActive := opts.MaxActiveStreams
+	if maxActive <= 0 {
+		maxActive = 4
+	}
+
 	return &config.ASR{
 		ModelPath:      modelPath,
 		NumThreads:     opts.NumThreads,
+		MaxActive:      maxActive,
 		DecodingMethod: opts.DecodingMethod,
 		MaxActivePaths: opts.MaxActivePaths,
 	}

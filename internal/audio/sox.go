@@ -70,13 +70,16 @@ func decodeWithSox(ctx context.Context, r io.Reader) ([]float32, error) {
 // readSoxOutput reads 32-bit float samples from the Sox process output.
 func readSoxOutput(stdout io.Reader, initialCapacity int) ([]float32, error) {
 	samples := make([]float32, 0, initialCapacity)
-	buf := make([]byte, 32*1024)
+	// Use a 32KB buffer for raw reads
+	raw := make([]byte, 32*1024)
 
 	for {
-		n, err := io.ReadFull(stdout, buf)
+		n, err := io.ReadFull(stdout, raw)
 		if n > 0 {
-			for i := 0; i+4 <= n; i += 4 {
-				bits := binary.LittleEndian.Uint32(buf[i:])
+			// Process whole samples (4 bytes each)
+			count := n / 4
+			for i := 0; i < count; i++ {
+				bits := binary.LittleEndian.Uint32(raw[i*4 : (i+1)*4])
 				samples = append(samples, math.Float32frombits(bits))
 			}
 		}

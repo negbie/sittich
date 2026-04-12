@@ -15,6 +15,7 @@ type Server struct {
 type ASR struct {
 	ModelPath      string
 	NumThreads     int
+	MaxActive      int
 	DecodingMethod string
 	MaxActivePaths int
 }
