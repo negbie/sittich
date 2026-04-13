@@ -9,10 +9,11 @@ import (
 
 // TranscribeRequest represents a transcription request
 type TranscribeRequest struct {
-	URL       string `json:"url,omitempty"`
-	Base64    string `json:"base64,omitempty"`
-	Format    string `json:"format"`     // text, json, vtt
-	ChunkSize int    `json:"chunk_size"` // seconds
+	URL       string   `json:"url,omitempty"`
+	Base64    string   `json:"base64,omitempty"`
+	Format    string   `json:"format"`     // text, json, vtt
+	ChunkSize int      `json:"chunk_size"` // seconds
+	SoxFlags  []string `json:"sox_flags"`  // optional additional sox effects
 }
 
 // TranscribeResponse represents a transcription response

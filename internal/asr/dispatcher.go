@@ -43,7 +43,7 @@ func NewDispatcher(engine speech.Engine, workers int, batchSize int, window time
 	ctx, cancel := context.WithCancel(context.Background())
 	d := &Dispatcher{
 		engine:    engine,
-		jobChan:   make(chan *asrJob, 128),
+		jobChan:   make(chan *asrJob, 512),
 		batchSize: batchSize,
 		window:    window,
 		ctx:       ctx,
@@ -125,7 +125,7 @@ func (d *Dispatcher) TranscribeBatch(ctx context.Context, chunks [][]float32, sa
 }
 
 func (d *Dispatcher) SupportedLanguages() []string { return d.engine.SupportedLanguages() }
-func (d *Dispatcher) ModelName() string          { return d.engine.ModelName() }
+func (d *Dispatcher) ModelName() string            { return d.engine.ModelName() }
 func (d *Dispatcher) Close() error {
 	d.closeOnce.Do(func() {
 		d.cancel()
@@ -153,7 +153,9 @@ func (d *Dispatcher) worker(id int) {
 		}
 
 		// 2. Greedy Drain & Wait-and-Batch
-		// First, greedily pull any jobs already waiting in the channel (zero latency)
+			// Stage 1: Zero-latency greedy drain.
+			// Pull any jobs already waiting in the channel to fill the batch immediately
+			// without introducing any artificial delay.
 	GreedyLoop:
 		for len(batch) < d.batchSize {
 			select {
@@ -163,11 +165,14 @@ func (d *Dispatcher) worker(id int) {
 				}
 				batch = append(batch, nextJob)
 			default:
+				// No more jobs currently buffered in the channel.
 				break GreedyLoop
 			}
 		}
 
-		// Second, if we still have room, wait for a short window
+		// Stage 2: Windowed wait.
+		// If the batch is still not full, start a short timer to wait for incoming jobs.
+		// This balances throughput (larger batches) vs. latency (maximum wait time).
 		if len(batch) < d.batchSize {
 			timer := time.NewTimer(d.window)
 

@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"runtime"
 	"syscall"
 	"time"
@@ -13,15 +12,11 @@ import (
 	"github.com/negbie/sittich/internal/asr"
 	"github.com/negbie/sittich/internal/config"
 	"github.com/negbie/sittich/internal/models"
-	"github.com/negbie/sittich/internal/pipeline"
 	"github.com/negbie/sittich/internal/server"
 	"github.com/negbie/sittich/internal/worker"
 )
 
 func runServer(opts *cliOptions) error {
-	hideCursor()
-	defer showCursor()
-
 	fmt.Fprint(os.Stderr, "Loading model...\r")
 	actualDataFolder, err := models.GetModelPath(opts.DataFolder)
 	if err != nil {
@@ -38,21 +33,15 @@ func runServer(opts *cliOptions) error {
 	defer recognizer.Close()
 	fmt.Fprintln(os.Stderr, "Model loaded!   ")
 
-	// Global ASR Dispatcher with focused parallel batching
-	dispatcher := asr.NewDispatcher(recognizer, opts.Workers, 16, 5*time.Millisecond, opts.Debug)
+	dispatcher := asr.NewDispatcher(recognizer, opts.DispatcherWorkers, opts.MaxBatchSize, 5*time.Millisecond, opts.Debug)
 	defer dispatcher.Close()
-
-	sharedVAD := setupVAD(opts, actualDataFolder)
-	if sharedVAD != nil {
-		defer sharedVAD.Close()
-	}
 
 	maxQueue := opts.MaxQueueSize
 	if maxQueue <= 0 {
 		maxQueue = opts.Workers * 2
 	}
 
-	pool := setupPool(opts, dispatcher, actualDataFolder, sharedVAD, maxQueue)
+	pool := setupPool(opts, dispatcher, actualDataFolder, maxQueue)
 	defer pool.Shutdown()
 
 	serverCfg := &config.Server{
@@ -67,8 +56,7 @@ func runServer(opts *cliOptions) error {
 	srv.SetDefaults(opts.Format, opts.ChunkSize)
 
 	fmt.Fprintf(os.Stderr, "   Concurrency: workers=%d dispatcher=%d max_active=%d num_threads=%d queue=%d (NumCPU=%d)\n",
-		opts.Workers, opts.Workers, cfg.MaxActive, opts.NumThreads, maxQueue, runtime.NumCPU())
-
+		opts.Workers, opts.DispatcherWorkers, cfg.MaxActive, opts.NumThreads, maxQueue, runtime.NumCPU())
 	fmt.Fprintf(os.Stderr, "   Server running on http://%s\n", opts.ListenAddr)
 	fmt.Fprintf(os.Stderr, "   POST /transcribe - Transcribe audio\n")
 	fmt.Fprintf(os.Stderr, "   GET  /health     - Health check\n\nPress Ctrl+C to stop\n")
@@ -90,41 +78,19 @@ func runServer(opts *cliOptions) error {
 	}
 }
 
-func setupVAD(opts *cliOptions, dataFolder string) *pipeline.VAD {
-	if !opts.UseVAD {
-		return nil
-	}
-	if err := models.EnsureVAD(dataFolder); err != nil {
-		fmt.Fprintf(os.Stderr, "   VAD download error: %v, falling back to blind chunking\n", err)
-		return nil
-	}
-	vadModelPath := filepath.Join(dataFolder, models.VADModelFile)
-	vad, err := pipeline.NewVAD(vadModelPath, float32(opts.VADThreshold), float32(opts.VADMinSilence), float32(opts.VADMinSpeech), 1)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "   VAD error: %v, falling back to blind chunking\n", err)
-		return nil
-	}
-	return vad
-}
-
-func setupPool(opts *cliOptions, dispatcher *asr.Dispatcher, dataFolder string, vad *pipeline.VAD, queueSize int) *worker.Pool {
+func setupPool(opts *cliOptions, dispatcher *asr.Dispatcher, dataFolder string, queueSize int) *worker.Pool {
 	return worker.NewPool(
 		opts.Workers,
 		queueSize,
 		dispatcher,
 		config.Pipeline{
-			ChunkDuration:         float64(opts.ChunkSize),
-			ChunkOverlapDuration:  opts.ChunkOverlapDuration,
-			WordTimestamps:        true,
-			Debug:                 opts.Debug,
-			UseVAD:                opts.UseVAD,
-			VADModelPath:          filepath.Join(dataFolder, models.VADModelFile),
-			VADThreshold:          float32(opts.VADThreshold),
-			VADMinSilenceDuration: float32(opts.VADMinSilence),
-			VADMinSpeechDuration:  float32(opts.VADMinSpeech),
+			ChunkDuration:        float64(opts.ChunkSize),
+			ChunkOverlapDuration: opts.ChunkOverlapDuration,
+			WordTimestamps:       true,
+			Debug:                opts.Debug,
+			DSPMode:              opts.DSPMode,
 		},
 		opts.Debug,
 		dataFolder,
-		vad,
 	)
 }

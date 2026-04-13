@@ -98,7 +98,7 @@ func (s *Server) handleTranscribe(w http.ResponseWriter, r *http.Request) {
 
 	requestStart := time.Now()
 
-	filePath, format, chunkSize, cleanup, err := s.parseRequest(r)
+	filePath, format, chunkSize, soxFlags, cleanup, err := s.parseRequest(r)
 	if err != nil {
 		s.sendError(w, http.StatusBadRequest, err.Error())
 		return
@@ -116,8 +116,8 @@ func (s *Server) handleTranscribe(w http.ResponseWriter, r *http.Request) {
 		FilePath:  filePath,
 		Format:    format,
 		ChunkSize: chunkSize,
-		Result:    make(chan worker.JobResult, 1),
-		Error:     make(chan error, 1),
+		SoxFlags:  soxFlags,
+		Done:      make(chan worker.JobDone, 1),
 		StartTime: time.Now(),
 		Ctx:       ctx,
 	}
@@ -134,16 +134,18 @@ func (s *Server) handleTranscribe(w http.ResponseWriter, r *http.Request) {
 	}
 
 	select {
-	case result := <-job.Result:
+	case done := <-job.Done:
+		if done.Err != nil {
+			if s.options != nil && s.options.Debug {
+				fmt.Fprintf(os.Stderr, "[HTTP] request_failed=%s job_id=%s err=%v\n", time.Since(requestStart).Round(time.Millisecond), job.ID, done.Err)
+			}
+			s.sendError(w, http.StatusInternalServerError, done.Err.Error())
+			return
+		}
 		if s.options != nil && s.options.Debug {
 			fmt.Fprintf(os.Stderr, "[HTTP] request_done=%s job_id=%s\n", time.Since(requestStart).Round(time.Millisecond), job.ID)
 		}
-		s.sendFormattedResponse(w, format, result)
-	case err := <-job.Error:
-		if s.options != nil && s.options.Debug {
-			fmt.Fprintf(os.Stderr, "[HTTP] request_failed=%s job_id=%s err=%v\n", time.Since(requestStart).Round(time.Millisecond), job.ID, err)
-		}
-		s.sendError(w, http.StatusInternalServerError, err.Error())
+		s.sendFormattedResponse(w, format, *done.Result)
 	case <-ctx.Done():
 		if cleanup != nil {
 			cleanup()
@@ -175,7 +177,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) parseRequest(r *http.Request) (filePath, format string, chunkSize int, cleanup func(), err error) {
+func (s *Server) parseRequest(r *http.Request) (filePath, format string, chunkSize int, soxFlags []string, cleanup func(), err error) {
 	format = s.options.DefaultFormat
 	if format == "" {
 		format = "text"
@@ -189,28 +191,28 @@ func (s *Server) parseRequest(r *http.Request) (filePath, format string, chunkSi
 
 	if strings.HasPrefix(contentType, "multipart/form-data") {
 		if err := r.ParseMultipartForm(s.options.MaxUploadMB * 1024 * 1024); err != nil {
-			return "", "", 0, nil, fmt.Errorf("failed to parse multipart form: %w", err)
+			return "", "", 0, nil, nil, fmt.Errorf("failed to parse multipart form: %w", err)
 		}
 
 		file, header, err := r.FormFile("file")
 		if err != nil {
-			return "", "", 0, nil, fmt.Errorf("missing file field: %w", err)
+			return "", "", 0, nil, nil, fmt.Errorf("missing file field: %w", err)
 		}
 		defer file.Close()
 
 		tmpFile, err := os.CreateTemp("", "sittich-upload-*-"+filepath.Base(header.Filename))
 		if err != nil {
-			return "", "", 0, nil, fmt.Errorf("failed to create temp file: %w", err)
+			return "", "", 0, nil, nil, fmt.Errorf("failed to create temp file: %w", err)
 		}
 
 		if _, err := io.Copy(tmpFile, file); err != nil {
 			tmpFile.Close()
 			os.Remove(tmpFile.Name())
-			return "", "", 0, nil, fmt.Errorf("failed to save file: %w", err)
+			return "", "", 0, nil, nil, fmt.Errorf("failed to save file: %w", err)
 		}
 		if err := tmpFile.Close(); err != nil {
 			os.Remove(tmpFile.Name())
-			return "", "", 0, nil, fmt.Errorf("failed to close temp file: %w", err)
+			return "", "", 0, nil, nil, fmt.Errorf("failed to close temp file: %w", err)
 		}
 
 		filePath = tmpFile.Name()
@@ -223,42 +225,51 @@ func (s *Server) parseRequest(r *http.Request) (filePath, format string, chunkSi
 				chunkSize = n
 			}
 		}
+		if sf := r.MultipartForm.Value["sox_flags"]; len(sf) > 0 {
+			for _, f := range sf {
+				soxFlags = append(soxFlags, strings.Fields(f)...)
+			}
+		}
+
+		cleanup = func() {
+			os.Remove(filePath)
+		}
 
 	} else if strings.HasPrefix(contentType, "application/json") {
 		var req TranscribeRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			return "", "", 0, nil, fmt.Errorf("invalid JSON: %w", err)
+			return "", "", 0, nil, nil, fmt.Errorf("invalid JSON: %w", err)
 		}
 
 		if req.URL != "" {
 			filePath, err = s.downloadFromURL(req.URL)
 			if err != nil {
-				return "", "", 0, nil, err
+				return "", "", 0, nil, nil, err
 			}
 		} else if req.Base64 != "" {
 			data, err := base64.StdEncoding.DecodeString(req.Base64)
 			if err != nil {
-				return "", "", 0, nil, fmt.Errorf("invalid base64: %w", err)
+				return "", "", 0, nil, nil, fmt.Errorf("invalid base64: %w", err)
 			}
 
 			tmpFile, err := os.CreateTemp("", "sittich-b64-*")
 			if err != nil {
-				return "", "", 0, nil, fmt.Errorf("failed to create temp file: %w", err)
+				return "", "", 0, nil, nil, fmt.Errorf("failed to create temp file: %w", err)
 			}
 
 			if _, err := tmpFile.Write(data); err != nil {
 				tmpFile.Close()
 				os.Remove(tmpFile.Name())
-				return "", "", 0, nil, fmt.Errorf("failed to write file: %w", err)
+				return "", "", 0, nil, nil, fmt.Errorf("failed to write file: %w", err)
 			}
 			if err := tmpFile.Close(); err != nil {
 				os.Remove(tmpFile.Name())
-				return "", "", 0, nil, fmt.Errorf("failed to close temp file: %w", err)
+				return "", "", 0, nil, nil, fmt.Errorf("failed to close temp file: %w", err)
 			}
 
 			filePath = tmpFile.Name()
 		} else {
-			return "", "", 0, nil, fmt.Errorf("missing url or base64 in request")
+			return "", "", 0, nil, nil, fmt.Errorf("missing url or base64 in request")
 		}
 
 		if req.Format != "" {
@@ -267,19 +278,28 @@ func (s *Server) parseRequest(r *http.Request) (filePath, format string, chunkSi
 		if req.ChunkSize > 0 {
 			chunkSize = req.ChunkSize
 		}
+		if len(req.SoxFlags) > 0 {
+			for _, f := range req.SoxFlags {
+				soxFlags = append(soxFlags, strings.Fields(f)...)
+			}
+		}
+
+		cleanup = func() {
+			os.Remove(filePath)
+		}
 
 	} else {
-		return "", "", 0, nil, fmt.Errorf("unsupported content type: %s", contentType)
+		return "", "", 0, nil, nil, fmt.Errorf("unsupported content type: %s", contentType)
 	}
 
 	if format != "text" && format != "json" && format != "vtt" {
 		if filePath != "" {
 			os.Remove(filePath)
 		}
-		return "", "", 0, nil, fmt.Errorf("invalid format: %s (must be text, json, or vtt)", format)
+		return "", "", 0, nil, nil, fmt.Errorf("invalid format: %s (must be text, json, or vtt)", format)
 	}
 
-	return filePath, format, chunkSize, nil, nil
+	return filePath, format, chunkSize, soxFlags, cleanup, nil
 }
 
 func (s *Server) downloadFromURL(url string) (string, error) {

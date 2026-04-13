@@ -31,7 +31,6 @@ type Engine interface {
 type Options struct {
 	Language         string
 	WordTimestamps   bool
-	VADFilter        bool
 	InitialPrompt    string
 	MaxSegmentLength int
 	Debug            bool

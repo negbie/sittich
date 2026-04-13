@@ -15,7 +15,7 @@ import (
 )
 
 // Pool manages a pool of transcription workers. Each worker has its own
-// private Pipeline/VAD instance to process audio in isolation.
+// private pipeline instance to process audio in isolation.
 type Pool struct {
 	workers      int
 	queue        chan *Job
@@ -27,11 +27,10 @@ type Pool struct {
 	busyCount    atomic.Int32
 	debug        bool
 	shutdownOnce sync.Once
-	vad          *pipeline.VAD
 }
 
 // NewPool creates a new worker pool
-func NewPool(workers int, queueSize int, engine speech.Engine, cfg config.Pipeline, debug bool, dataDir string, vad *pipeline.VAD) *Pool {
+func NewPool(workers int, queueSize int, engine speech.Engine, cfg config.Pipeline, debug bool, dataDir string) *Pool {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	p := &Pool{
@@ -42,7 +41,6 @@ func NewPool(workers int, queueSize int, engine speech.Engine, cfg config.Pipeli
 		ctx:         ctx,
 		cancel:      cancel,
 		debug:       debug,
-		vad:         vad,
 	}
 
 	// Start workers
@@ -55,11 +53,20 @@ func NewPool(workers int, queueSize int, engine speech.Engine, cfg config.Pipeli
 }
 
 func (p *Pool) Submit(job *Job) error {
+	// 1. Immediate non-blocking attempt for high-throughput
 	select {
 	case p.queue <- job:
 		return nil
-	case <-time.After(5 * time.Second):
-		return fmt.Errorf("queue full, waited 5s (max %d jobs)", cap(p.queue))
+	default:
+	}
+
+	// 2. Queue is full: block while waiting for a worker to free up a slot OR 
+	// until the request is cancelled by the HTTP client (timeout/disconnect).
+	select {
+	case p.queue <- job:
+		return nil
+	case <-job.Ctx.Done():
+		return fmt.Errorf("queue full, request cancelled (max %d jobs)", cap(p.queue))
 	}
 }
 
@@ -77,14 +84,9 @@ func (p *Pool) TotalWorkers() int {
 
 func (p *Pool) Shutdown() {
 	p.shutdownOnce.Do(func() {
-		p.cancel()          // Signal workers to stop
-		close(p.queue)      // Close job queue
-		p.wg.Wait()         // Wait for all workers to finish
-
-		// Additional safety: ensure no workers are busy before closing engine
-		for p.busyCount.Load() > 0 {
-			time.Sleep(10 * time.Millisecond)
-		}
+		p.cancel()     // Signal workers to stop
+		close(p.queue) // Close job queue
+		p.wg.Wait()    // Wait for all workers to finish
 
 		// Now safe to close the shared engine
 		if p.engine != nil {
@@ -96,8 +98,8 @@ func (p *Pool) Shutdown() {
 func (p *Pool) worker(id int) {
 	defer p.wg.Done()
 
-	// 1. Initialise a private Pipeline for this worker with the shared VAD.
-	pipe, err := pipeline.NewPipeline(p.engine, p.pipelineCfg, p.vad)
+	// 1. Initialise a private Pipeline for this worker.
+	pipe, err := pipeline.NewPipeline(p.engine, p.pipelineCfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Worker %d: failed to initialise pipeline: %v\n", id, err)
 		return
@@ -136,16 +138,12 @@ func (p *Pool) processJobWithPipeline(workerID int, job *Job, pipe *pipeline.Pip
 
 	startTime := time.Now()
 
-	result, err := pipe.Process(job.Ctx, job.FilePath, float64(job.ChunkSize))
+	result, err := pipe.Process(job.Ctx, job.FilePath, float64(job.ChunkSize), job.SoxFlags...)
 	if err != nil {
 		if p.debug {
 			fmt.Fprintf(os.Stderr, "[Worker %d] Job %s failed processing_time=%s err=%v\n", workerID, job.ID, time.Since(startTime).Round(time.Millisecond), err)
 		}
-		select {
-		case job.Error <- fmt.Errorf("pipeline processing failed: %w", err):
-		case <-job.Ctx.Done():
-		case <-p.ctx.Done():
-		}
+		p.sendDone(job, JobDone{Err: fmt.Errorf("pipeline processing failed: %w", err)})
 		return
 	}
 
@@ -161,15 +159,26 @@ func (p *Pool) processJobWithPipeline(workerID int, job *Job, pipe *pipeline.Pip
 		fmt.Fprintf(os.Stderr, "[Worker %d] Job %s done processing_time=%s total_time=%s rtf=%.2f\n", workerID, job.ID, processingElapsed, totalElapsed, rtFactor)
 	}
 
+	p.sendDone(job, JobDone{
+		Result: &JobResult{
+			Duration:       result.Duration,
+			ProcessingTime: processingTime,
+			RealtimeFactor: rtFactor,
+			Text:           result.FullText(),
+			Segments:       result.Segments,
+		},
+	})
+}
+
+// sendDone delivers the job result or error back to the caller.
+// It is thread-safe and ensures we don't block indefinitely if the 
+// original request context was cancelled while the worker was busy.
+func (p *Pool) sendDone(job *Job, done JobDone) {
 	select {
-	case job.Result <- JobResult{
-		Duration:       result.Duration,
-		ProcessingTime: processingTime,
-		RealtimeFactor: rtFactor,
-		Text:           result.FullText(),
-		Segments:       result.Segments,
-	}:
+	case job.Done <- done:
 	case <-job.Ctx.Done():
+		// Request was cancelled/timed out, caller is no longer listening.
 	case <-p.ctx.Done():
+		// Global pool shutdown.
 	}
 }

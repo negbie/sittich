@@ -36,21 +36,9 @@ type Pipeline struct {
 	// Language is a BCP-47 hint passed to the engine (empty = auto-detect).
 	Language string
 
-	// UseVAD enables the voice activity detector (Silero VAD) for chunking.
-	UseVAD bool
-
-	// VADModelPath is the absolute path to the silero_vad.onnx model.
-	VADModelPath string
-
-	// VADThreshold is the probability threshold for speech detection (0.0 to 1.0, default 0.5).
-	VADThreshold float32
-
-	// VADMinSilenceDuration is the minimum silence duration in seconds to separate segments (default 0.2).
-	VADMinSilenceDuration float32
-
-	// VADMinSpeechDuration is the minimum speech duration in seconds to keep a segment (default 0.2).
-	VADMinSpeechDuration float32
-
 	// Debug enables detailed console logging.
 	Debug bool
+
+	// DSPMode selects the audio conditioning chain: "minimal", "gentle", "aggressive".
+	DSPMode string
 }

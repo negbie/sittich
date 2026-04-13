@@ -17,8 +17,8 @@ type ChunkResult struct {
 
 // StitchResults merges multiple ChunkResults into a single speech.Result by
 // offsetting chunk-relative timestamps into the original audio timeline and
-// merging overlapping regions using a token-level LCS algorithm.
-func StitchResults(chunks []ChunkResult) *speech.Result {
+// merging overlapping regions using a robust midpoint-temporal split.
+func StitchResults(chunks []ChunkResult, padding float64, debug bool) *speech.Result {
 	if len(chunks) == 0 {
 		return &speech.Result{}
 	}
@@ -52,139 +52,102 @@ func StitchResults(chunks []ChunkResult) *speech.Result {
 		}
 	}
 
-	// 2. Merge chunks sequentially
+	// 2. Merge chunks sequentially using temporal ownership
 	allWords := make([]speech.Word, 0)
 	var prevOrigEnd float64
-	for i, cr := range chunks {
-		if cr.Result == nil || len(cr.Result.Segments) == 0 {
+
+	for _, cr := range chunks {
+		if cr.Result == nil {
 			continue
 		}
 
-		chunkWords := make([]speech.Word, 0)
+		// Group raw tokens into logical words
+		rawTokens := make([]speech.Word, 0)
 		for _, seg := range cr.Result.Segments {
-			chunkWords = append(chunkWords, seg.Words...)
+			rawTokens = append(rawTokens, seg.Words...)
 		}
-
-		// The padding region is for context only; its transcription shouldn't leak.
-		if cr.OrigEnd > cr.OrigStart {
-			filtered := make([]speech.Word, 0, len(chunkWords))
-			for _, w := range chunkWords {
-				mid := w.Start + (w.End-w.Start)/2
-				// Important: Use strictly less than (<) for OrigEnd to ensure a word
-				// with its midpoint exactly on the boundary is not duplicated.
-				if mid >= cr.OrigStart && mid < cr.OrigEnd {
-					filtered = append(filtered, w)
-				}
-			}
-			chunkWords = filtered
-		}
-
-		if len(chunkWords) == 0 {
+		chunkGroups := groupTokensToWords(rawTokens)
+		if len(chunkGroups) == 0 {
 			continue
 		}
 
-		if i == 0 {
-			allWords = append(allWords, chunkWords...)
-			prevOrigEnd = cr.OrigEnd
-			continue
-		}
-
-		// Handle overlap with the words already in allWords
 		if len(allWords) == 0 {
-			allWords = append(allWords, chunkWords...)
+			// First chunk: keep everything within its logical range [OrigStart, OrigEnd]
+			for _, g := range chunkGroups {
+				mid := g.Start + (g.End-g.Start)/2
+				if mid < cr.OrigEnd {
+					allWords = append(allWords, g.Tokens...)
+				}
+			}
 			prevOrigEnd = cr.OrigEnd
 			continue
 		}
 
-		// Find relevant words in the overlap period
-		// We use a window of overlap to search for common tokens
-		lastTokenGlobalEnd := allWords[len(allWords)-1].End
-		overlapStart := chunkWords[0].Start
+		// Successive chunks: Split at the midpoint of the overlap
+		splitPoint := (cr.OrigStart + prevOrigEnd) / 2
 
-		if overlapStart >= lastTokenGlobalEnd || cr.OrigStart >= prevOrigEnd {
-			allWords = append(allWords, chunkWords...)
-			prevOrigEnd = cr.OrigEnd
-			continue
+		// A. Trim existing words to the split point
+		trimmedA := make([]speech.Word, 0, len(allWords))
+		for _, w := range allWords {
+			mid := w.Start + (w.End-w.Start)/2
+			if mid < splitPoint {
+				trimmedA = append(trimmedA, w)
+			}
 		}
 
-		// Find anchor in allWords and chunkWords using LCS
-		// Look back/forward up to 2 seconds or 20 words
-		const windowWords = 20
-		aStart := len(allWords) - windowWords
-		if aStart < 0 {
-			aStart = 0
-		}
-		a := allWords[aStart:]
-
-		bEnd := windowWords
-		if bEnd > len(chunkWords) {
-			bEnd = len(chunkWords)
-		}
-		b := chunkWords[:bEnd]
-
-		// Perform LCS on word text
-		aTexts := make([]string, len(a))
-		for i, w := range a {
-			aTexts[i] = normalizeForMatch(w.Word)
-		}
-		bTexts := make([]string, len(b))
-		for i, w := range b {
-			bTexts[i] = normalizeForMatch(w.Word)
+		// B. Collect words from the new chunk starting from the split point
+		trimmedB := make([]speech.Word, 0, len(rawTokens))
+		for _, g := range chunkGroups {
+			mid := g.Start + (g.End-g.Start)/2
+			if mid >= splitPoint && mid < cr.OrigEnd {
+				trimmedB = append(trimmedB, g.Tokens...)
+			}
 		}
 
-		lcsIndices := findLCS(aTexts, bTexts)
-		if len(lcsIndices) == 0 {
-			// Bug #3 fallback: No LCS found, use temporal overlap to find a cut point.
-			// We split at the midpoint of the temporal overlap between existing results
-			// and the new chunk.
-			cutPoint := (overlapStart + lastTokenGlobalEnd) / 2
+		// C. Correct boundary artifacts (Dumb-but-Correct De-duplication)
+		if len(trimmedA) > 0 && len(trimmedB) > 0 {
+			// Get the last word of A and first word of B for comparison
+			lastWordA := groupTokensToWords(trimmedA)
+			firstWordB := groupTokensToWords(trimmedB)
 
-			// Trim allWords to cutPoint
-			newAllWords := make([]speech.Word, 0, len(allWords))
-			for _, w := range allWords {
-				if (w.Start + (w.End-w.Start)/2) < cutPoint {
-					newAllWords = append(newAllWords, w)
+			if len(lastWordA) > 0 && len(firstWordB) > 0 {
+				wa := lastWordA[len(lastWordA)-1]
+				wb := firstWordB[0]
+
+				if normalizeForMatch(wa.Text()) == normalizeForMatch(wb.Text()) {
+					// Drop the redundant word from the beginning of B
+					trimmedB = trimmedB[len(wb.Tokens):]
 				}
 			}
-			allWords = newAllWords
-
-			// Append chunkWords starting from cutPoint
-			for _, w := range chunkWords {
-				if (w.Start + (w.End-w.Start)/2) >= cutPoint {
-					allWords = append(allWords, w)
-				}
-			}
-			continue
 		}
 
-		// Pick the middle of the LCS as the split point
-		midLCS := len(lcsIndices) / 2
-		idxA := aStart + lcsIndices[midLCS].i
-		idxB := lcsIndices[midLCS].j
-
-		// Keep allWords up to idxA (exclusive) and chunkWords from idxB (exclusive)
-		// Let's keep the LCS token from allWords.
-		allWords = allWords[:idxA+1]
-		if idxB+1 < len(chunkWords) {
-			allWords = append(allWords, chunkWords[idxB+1:]...)
-		}
-
+		allWords = append(trimmedA, trimmedB...)
 		prevOrigEnd = cr.OrigEnd
 	}
 
-	// 3. Rebuild segments from merged words
-	var b strings.Builder
-	b.Grow(len(allWords) * 6)
-	for _, w := range allWords {
-		b.WriteString(w.Word)
+	// 3. Rebuild monolithic segment text from merged tokens
+	var builder strings.Builder
+	builder.Grow(len(allWords) * 6)
+	for i, w := range allWords {
+		t := w.Word
+		if strings.HasPrefix(t, "\u2581") {
+			if i > 0 {
+				builder.WriteByte(' ')
+			}
+			t = strings.TrimPrefix(t, "\u2581")
+		} else if strings.HasPrefix(t, " ") {
+			if i > 0 {
+				builder.WriteByte(' ')
+			}
+			t = strings.TrimPrefix(t, " ")
+		}
+		builder.WriteString(t)
 	}
-	resText := strings.TrimSpace(b.String())
+	resText := strings.TrimSpace(builder.String())
 
 	combined.Segments = []speech.Segment{
 		{
 			ID:    0,
-			Start: 0,
-			End:   0,
 			Text:  resText,
 			Words: allWords,
 		},
@@ -198,52 +161,48 @@ func StitchResults(chunks []ChunkResult) *speech.Result {
 	return combined
 }
 
-type lcsMatch struct {
-	i, j int
+type wordGroup struct {
+	Tokens []speech.Word
+	Start  float64
+	End    float64
 }
 
-func findLCS(a, b []string) []lcsMatch {
-	n, m := len(a), len(b)
-	if n == 0 || m == 0 {
+func (g wordGroup) Text() string {
+	var s string
+	for _, t := range g.Tokens {
+		s += t.Word
+	}
+	return s
+}
+
+// groupTokensToWords consolidates subword tokens into logical words.
+func groupTokensToWords(tokens []speech.Word) []wordGroup {
+	if len(tokens) == 0 {
 		return nil
 	}
-	dp := make([][]int, n+1)
-	for i := range dp {
-		dp[i] = make([]int, m+1)
-	}
-
-	for i := 1; i <= n; i++ {
-		for j := 1; j <= m; j++ {
-			if a[i-1] == b[j-1] && a[i-1] != "" {
-				dp[i][j] = dp[i-1][j-1] + 1
-			} else {
-				if dp[i-1][j] > dp[i][j-1] {
-					dp[i][j] = dp[i-1][j]
-				} else {
-					dp[i][j] = dp[i][j-1]
-				}
+	var groups []wordGroup
+	var current wordGroup
+	for _, t := range tokens {
+		isNew := strings.HasPrefix(t.Word, "\u2581") || strings.HasPrefix(t.Word, " ")
+		if isNew || len(current.Tokens) == 0 {
+			if len(current.Tokens) > 0 {
+				groups = append(groups, current)
 			}
-		}
-	}
-
-	matches := make([]lcsMatch, 0)
-	i, j := n, m
-	for i > 0 && j > 0 {
-		if a[i-1] == b[j-1] && a[i-1] != "" {
-			matches = append([]lcsMatch{{i - 1, j - 1}}, matches...)
-			i--
-			j--
-		} else if dp[i-1][j] > dp[i][j-1] {
-			i--
+			current = wordGroup{Tokens: []speech.Word{t}, Start: t.Start, End: t.End}
 		} else {
-			j--
+			current.Tokens = append(current.Tokens, t)
+			current.End = t.End
 		}
 	}
-	return matches
+	if len(current.Tokens) > 0 {
+		groups = append(groups, current)
+	}
+	return groups
 }
 
 func normalizeForMatch(s string) string {
+	s = strings.ReplaceAll(s, "\u2581", "")
 	s = strings.ToLower(strings.TrimSpace(s))
-	s = strings.Trim(s, ".,;!?:")
+	s = strings.Trim(s, ".,;!?: ")
 	return s
 }

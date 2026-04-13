@@ -28,7 +28,7 @@ func NewRecognizer(cfg *config.ASR) (*Recognizer, error) {
 	sherpaConfig := sherpa.OfflineRecognizerConfig{
 		FeatConfig: sherpa.FeatureConfig{
 			SampleRate: 16000,
-			FeatureDim: 80,
+			FeatureDim: 128,
 		},
 		ModelConfig: sherpa.OfflineModelConfig{
 			Transducer: sherpa.OfflineTransducerModelConfig{
@@ -86,19 +86,29 @@ func (r *Recognizer) TranscribeBatch(ctx context.Context, chunks [][]float32, sa
 		return nil, err
 	}
 
-	streams := make([]*sherpa.OfflineStream, 0, len(chunks))
-	for _, audio := range chunks {
+	streams := make([]*sherpa.OfflineStream, len(chunks))
+	for i := range chunks {
 		s := sherpa.NewOfflineStream(r.recognizer)
 		if s == nil {
 			for _, st := range streams {
-				sherpa.DeleteOfflineStream(st)
+				if st != nil {
+					sherpa.DeleteOfflineStream(st)
+				}
 			}
 			return nil, fmt.Errorf("failed to create offline stream")
 		}
-
-		s.AcceptWaveform(sampleRate, audio)
-		streams = append(streams, s)
+		streams[i] = s
 	}
+
+	var wg sync.WaitGroup
+	for i, audio := range chunks {
+		wg.Add(1)
+		go func(s *sherpa.OfflineStream, a []float32) {
+			defer wg.Done()
+			s.AcceptWaveform(sampleRate, a)
+		}(streams[i], audio)
+	}
+	wg.Wait()
 
 	// Acquire a concurrency slot. ONNX Runtime's arena allocator never releases
 	// memory, so too many concurrent DecodeStreams calls cause unbounded growth.
@@ -155,14 +165,21 @@ func (r *Recognizer) TranscribeBatch(ctx context.Context, chunks [][]float32, sa
 		}
 
 		if len(sherpaResult.Timestamps) > 0 {
-			res.Segments[0].Words = make([]speech.Word, len(sherpaResult.Tokens))
-			for j, token := range sherpaResult.Tokens {
-				if j < len(sherpaResult.Timestamps) {
-					res.Segments[0].Words[j] = speech.Word{
-						Word:  token,
-						Start: float64(sherpaResult.Timestamps[j]),
-						End:   float64(sherpaResult.Timestamps[j]) + 0.1,
+			n := min(len(sherpaResult.Tokens), len(sherpaResult.Timestamps))
+			res.Segments[0].Words = make([]speech.Word, n)
+			for j := range n {
+				start := float64(sherpaResult.Timestamps[j])
+				end := start + 0.1
+				if j+1 < n {
+					nextStart := float64(sherpaResult.Timestamps[j+1])
+					if nextStart > start {
+						end = nextStart
 					}
+				}
+				res.Segments[0].Words[j] = speech.Word{
+					Word:  sherpaResult.Tokens[j],
+					Start: start,
+					End:   end,
 				}
 			}
 		}

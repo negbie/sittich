@@ -13,10 +13,16 @@ type Job struct {
 	FilePath  string
 	Format    string
 	ChunkSize int
-	Result    chan JobResult
-	Error     chan error
+	SoxFlags  []string
+	Done      chan JobDone
 	StartTime time.Time
 	Ctx       context.Context
+}
+
+// JobDone holds either a successful result or an error.
+type JobDone struct {
+	Result *JobResult
+	Err    error
 }
 
 // JobResult holds the result of a transcription job

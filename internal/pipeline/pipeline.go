@@ -1,5 +1,4 @@
-// Package pipeline orchestrates the full speech-to-text pipeline: decode,
-// resample, VAD, chunk, transcribe, and stitch.
+// Package pipeline orchestrates the full speech-to-text pipeline
 package pipeline
 
 import (
@@ -17,13 +16,12 @@ import (
 	"github.com/negbie/sittich/internal/speech"
 )
 
-// Pipeline ties together audio decoding, optional VAD, chunking, engine
+// Pipeline ties together audio decoding, chunking, engine
 // inference, and result stitching.
 type Pipeline struct {
 	engine speech.Engine
 	config config.Pipeline
 	ready  atomic.Bool
-	vad    *VAD
 }
 
 // New creates a Pipeline that delegates transcription to the given engine.
@@ -38,11 +36,10 @@ func New(eng speech.Engine) *Pipeline {
 }
 
 // NewPipeline creates a fully configured Pipeline.
-func NewPipeline(eng speech.Engine, cfg config.Pipeline, vad *VAD) (*Pipeline, error) {
+func NewPipeline(eng speech.Engine, cfg config.Pipeline) (*Pipeline, error) {
 	p := &Pipeline{
 		engine: eng,
 		config: cfg,
-		vad:    vad,
 	}
 
 	if eng != nil {
@@ -68,17 +65,16 @@ func (p *Pipeline) ModelName() string {
 // Close releases resources held by the pipeline.
 func (p *Pipeline) Close() error {
 	p.ready.Store(false)
-	// Note: p.vad is a shared resource owned by the caller; do not close it here.
 	return nil
 }
 
 // TranscribeFile decodes the audio file at path and runs the full pipeline.
-func (p *Pipeline) TranscribeFile(ctx context.Context, path string, opts speech.Options) (*speech.Result, error) {
+func (p *Pipeline) TranscribeFile(ctx context.Context, path string, opts speech.Options, soxFlags ...string) (*speech.Result, error) {
 	if !p.ready.Load() {
 		return nil, fmt.Errorf("pipeline: not ready, model is still loading")
 	}
 
-	samples, sampleRate, channels, err := decodeAudioFile(ctx, path)
+	samples, sampleRate, channels, err := decodeAudioFile(ctx, path, soxFlags...)
 	if err != nil {
 		return nil, fmt.Errorf("pipeline: decode: %w", err)
 	}
@@ -89,8 +85,8 @@ func (p *Pipeline) TranscribeFile(ctx context.Context, path string, opts speech.
 
 // Process decodes the audio file at audioPath and runs the pipeline.
 // If chunkDuration is > 0, it overrides the pipeline's default setting.
-func (p *Pipeline) Process(ctx context.Context, audioPath string, chunkDuration float64) (*speech.Result, error) {
-	samples, sampleRate, channels, err := decodeAudioFile(ctx, audioPath)
+func (p *Pipeline) Process(ctx context.Context, audioPath string, chunkDuration float64, soxFlags ...string) (*speech.Result, error) {
+	samples, sampleRate, channels, err := decodeAudioFile(ctx, audioPath, soxFlags...)
 	if err != nil {
 		return nil, fmt.Errorf("pipeline: decode: %w", err)
 	}
@@ -127,141 +123,49 @@ func (p *Pipeline) processAudioInternal(ctx context.Context, samples []float32, 
 	const targetRate = 16000
 	overlap := p.config.ChunkOverlapDuration
 
-	padding := 0.30 // 300ms floor for context
+	// Padding provides acoustic context for the ASR model at chunk boundaries,
+	// preventing cut-off words and giving the stitcher overlap for alignment.
+	padding := 0.6
 	if overlap > 0 {
-		// Optimization: Scale context padding with overlap to provide better anchors for the stitcher.
 		if overlap/2 > padding {
 			padding = overlap / 2
 		}
 	} else {
-		padding = 0.0
+		padding = 0.3 // minimal context even without overlap
 	}
 
 	totalStart := time.Now()
 
 	if p.config.Debug {
+		audio.DebugPlotWaveform(samples, "Before DSP")
+	}
+
+	// Apply audio conditioning based on DSP mode
+	audio.ConditionAudioSignal(samples, 0.9, 16000, p.config.DSPMode)
+
+	if p.config.Debug {
+		audio.DebugPlotWaveform(samples, "After DSP")
 		fmt.Fprint(os.Stderr, "   [Pipeline] Stage signal_processed")
 		p.verifySignal(samples, targetRate)
 	}
 
-	resampled := samples
+	pcm := samples
 
 	// 1. Tiling & Chunking
-	totalDur := float64(len(resampled)) / float64(targetRate)
-	var chunks []Chunk
-
-	doBlindChunking := func() {
-		step := chunkDuration - overlap
-		if step <= 0 {
-			step = chunkDuration
-		}
-
-		for start := 0.0; start < totalDur; {
-			origStart := start
-			origEnd := start + chunkDuration
-			if origEnd > totalDur {
-				origEnd = totalDur
-			}
-
-			chunkStart := origStart - padding
-			if chunkStart < 0 {
-				chunkStart = 0
-			}
-			chunkEnd := origEnd + padding
-			if chunkEnd > totalDur {
-				chunkEnd = totalDur
-			}
-
-			chunks = append(chunks, Chunk{
-				Start:     chunkStart,
-				End:       chunkEnd,
-				OrigStart: origStart,
-				OrigEnd:   origEnd,
-			})
-
-			if overlap >= chunkDuration || origEnd >= totalDur {
-				start = origEnd
-			} else {
-				start += step
-			}
-		}
+	totalDur := float64(len(pcm)) / float64(targetRate)
+	if p.config.Debug {
+		fmt.Fprintf(os.Stderr, "   [Pipeline] path=energy_aware chunk_duration=%.1fs overlap=%.1fs padding=%.1fs\n", chunkDuration, overlap, padding)
 	}
 
-	if p.vad != nil {
-		segments, err := p.vad.DetectSpeech(resampled, targetRate)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "VAD error: %v, falling back to blind chunking\n", err)
-			doBlindChunking()
-		} else {
-			chunks = ChunkSpeechSegments(resampled, targetRate, segments, chunkDuration, overlap)
-			if len(chunks) == 0 { // No speech detected
-				return &speech.Result{Duration: totalDur}, nil
-			}
+	searchWindow := 5.0
+	var chunks []Chunk = ChunkAudioEnergyAware(pcm, targetRate, chunkDuration, searchWindow, overlap, padding)
 
-			// Add padding to chunks to ensure context
-			for i := range chunks {
-				// Physical audio bounds (padding for engine acoustic context)
-				chunks[i].Start -= padding
-				if chunks[i].Start < 0 {
-					chunks[i].Start = 0
-				}
-				chunks[i].End += padding
-				if chunks[i].End > totalDur {
-					chunks[i].End = totalDur
-				}
-
-				// Logical transcription bounds (OrigStart/OrigEnd)
-				// VAD tightly bounds speech. We expand the logical bounds into the
-				// surrounding silence (if any) to authorize edge words captured by the padding.
-				origStartExpand := chunks[i].OrigStart - padding
-				if i > 0 {
-					gap := chunks[i].OrigStart - chunks[i-1].OrigEnd
-					if gap > 0 {
-						// There is a silence gap. Limit expansion to halfway across the gap.
-						midpoint := chunks[i-1].OrigEnd + gap/2
-						if origStartExpand < midpoint {
-							origStartExpand = midpoint
-						}
-					} else {
-						// Oversized chunk split. Prevent OrigStart from expanding backwards
-						// to maintain strict deduplication bounds for the stitcher.
-						origStartExpand = chunks[i].OrigStart
-					}
-				}
-				if origStartExpand < 0 {
-					origStartExpand = 0
-				}
-				chunks[i].OrigStart = origStartExpand
-
-				origEndExpand := chunks[i].OrigEnd + padding
-				if i < len(chunks)-1 {
-					gap := chunks[i+1].OrigStart - chunks[i].OrigEnd
-					if gap > 0 {
-						midpoint := chunks[i].OrigEnd + gap/2
-						if origEndExpand > midpoint {
-							origEndExpand = midpoint
-						}
-					} else {
-						origEndExpand = chunks[i].OrigEnd
-					}
-				}
-				if origEndExpand > totalDur {
-					origEndExpand = totalDur
-				}
-				chunks[i].OrigEnd = origEndExpand
-			}
-		}
-	} else {
-		doBlindChunking()
-	}
-
-	allChunkResults, err := p.transcribeChunks(ctx, resampled, targetRate, chunks, opts)
+	allChunkResults, err := p.transcribeChunks(ctx, pcm, targetRate, chunks, opts)
 	if err != nil {
 		return nil, err
 	}
 
-	// Release the decoded audio so the GC can reclaim it during stitching.
-	resampled = nil
+	pcm = nil
 
 	if len(allChunkResults) == 0 {
 		return &speech.Result{Duration: totalDur}, nil
@@ -272,7 +176,7 @@ func (p *Pipeline) processAudioInternal(ctx context.Context, samples []float32, 
 		return allChunkResults[i].Offset < allChunkResults[j].Offset
 	})
 
-	combined := StitchResults(allChunkResults)
+	combined := StitchResults(allChunkResults, padding, p.config.Debug)
 	combined.Duration = totalDur
 
 	for i := range combined.Segments {
@@ -355,6 +259,18 @@ func (p *Pipeline) transcribeChunks(ctx context.Context, resampled []float32, ta
 
 	if p.config.Debug {
 		fmt.Fprintf(os.Stderr, "   [Pipeline] Stage batch_asr_total=%s chunks=%d\n", time.Since(asrTotalStart).Round(time.Millisecond), len(chunks))
+		for i, cr := range chunkResults {
+			if cr.Result == nil {
+				continue
+			}
+			text := cr.Result.FullText()
+			wordCount := 0
+			if len(cr.Result.Segments) > 0 {
+				wordCount = len(cr.Result.Segments[0].Words)
+			}
+			fmt.Fprintf(os.Stderr, "   [Pipeline] chunk=%d orig=%.2f-%.2fs words=%d text=%q\n",
+				i, cr.OrigStart, cr.OrigEnd, wordCount, text)
+		}
 	}
 
 	return chunkResults, nil
@@ -370,14 +286,14 @@ func (p *Pipeline) mergeOptions(opts speech.Options) speech.Options {
 	return opts
 }
 
-func decodeAudioFile(ctx context.Context, path string) ([]float32, int, int, error) {
+func decodeAudioFile(ctx context.Context, path string, soxFlags ...string) ([]float32, int, int, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, 0, 0, err
 	}
 	defer f.Close()
 
-	samples, err := audio.DecodeWAV(ctx, f)
+	samples, err := audio.DecodeWAV(ctx, f, soxFlags...)
 	if err != nil {
 		return nil, 0, 0, err
 	}

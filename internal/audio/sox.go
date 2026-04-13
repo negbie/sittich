@@ -10,19 +10,21 @@ import (
 	"os/exec"
 )
 
-// decodeWithSox shells out to 'sox' to decode and preprocess audio.
-// Sox handles decoding, resampling to 16kHz, mono mixdown, filtering,
-// and gain normalization — producing 32-bit float output for the ASR model.
-func decodeWithSox(ctx context.Context, r io.Reader) ([]float32, error) {
+// decodeWithSox shells out to the 'sox' utility to decode and process audio in-memory.
+// It leverages pipes for zero-disk streaming, converting any input format supported
+// by Sox into 32-bit little-endian raw floats at 16kHz Mono.
+func decodeWithSox(ctx context.Context, r io.Reader, extraFlags ...string) ([]float32, error) {
 	initialCapacity := 1024 * 1024 // ~1 min of 16kHz float32
 
-	// Build Sox command: input from stdin, output raw float32 to stdout
-	// sox [input-options] - [output-options] - [effects]
 	args := []string{
-		"-",                                                                            // input from stdin
-		"-t", "raw", "-r", "16000", "-c", "1", "-e", "floating-point", "-b", "32", "-", // output options + stdout
-		"highpass", "100",
-		"gain", "-n",
+		"-q", "--no-dither",
+		"-",                                                             // Infile: read from stdin
+		"-t", "raw", "-c", "1", "-e", "floating-point", "-b", "32", "-", // Outfile: write raw float32 to stdout
+		"rate", "-v", "16k",
+	}
+
+	if len(extraFlags) > 0 {
+		args = append(args, extraFlags...)
 	}
 
 	cmd := exec.CommandContext(ctx, "sox", args...)
@@ -51,6 +53,7 @@ func decodeWithSox(ctx context.Context, r io.Reader) ([]float32, error) {
 
 	select {
 	case <-done:
+		// Sox process finished its work or failed.
 		if readErr != nil {
 			return nil, readErr
 		}
@@ -59,10 +62,11 @@ func decodeWithSox(ctx context.Context, r io.Reader) ([]float32, error) {
 		}
 		return samples, nil
 	case <-ctx.Done():
+		// HTTP request timeout or cancellation: immediately terminate the subprocess.
 		if cmd.Process != nil {
 			cmd.Process.Kill()
 		}
-		cmd.Wait()
+		cmd.Wait() // Reclaim process resources
 		return nil, ctx.Err()
 	}
 }

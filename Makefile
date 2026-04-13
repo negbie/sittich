@@ -9,7 +9,7 @@ VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev
 # We also link statically using CGO_LDFLAGS provided in internal/asr/cgo.go
 GO_LDFLAGS := -s -w -X main.version=$(VERSION)
 
-.PHONY: all build release clean help
+.PHONY: all build bench release clean help
 
 all: build
 
@@ -29,6 +29,18 @@ build:
 	go build -ldflags="$(GO_LDFLAGS)" -o $(BIN_DIR)/$(BINARY_NAME) ./cmd/sittich
 	@echo "Binary ready in $(BIN_DIR)/"
 	@ls -sh $(BIN_DIR)/
+ 
+bench:
+	@echo "Building benchmarking tool..."
+	@mkdir -p $(BIN_DIR)
+	go build -ldflags="$(GO_LDFLAGS)" -o $(BIN_DIR)/bench ./cmd/bench
+	@echo "Tool ready in $(BIN_DIR)/bench"
+
+regression:
+	@echo "Building regression test tool..."
+	@mkdir -p $(BIN_DIR)
+	go build -ldflags="$(GO_LDFLAGS)" -o $(BIN_DIR)/test-regression ./cmd/test-regression
+	@echo "Tool ready in $(BIN_DIR)/test-regression"
 
 # Final release optimization (Strip + UPX)
 release: build

@@ -19,9 +19,6 @@ const (
 	DecoderFile = "decoder.int8.onnx"
 	JoinerFile  = "joiner.int8.onnx"
 	TokensFile  = "tokens.txt"
-
-	VADModelURL  = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx"
-	VADModelFile = "silero_vad.onnx"
 )
 
 var requiredModelFiles = []string{EncoderFile, DecoderFile, JoinerFile, TokensFile}
@@ -82,17 +79,7 @@ func GetModelPath(dataDir string) (string, error) {
 	return dataDir, nil
 }
 
-// EnsureVAD downloads the Silero VAD model to dataDir if it is not already present.
-func EnsureVAD(dataDir string) error {
-	vadPath := filepath.Join(dataDir, VADModelFile)
-	if _, err := os.Stat(vadPath); os.IsNotExist(err) {
-		fmt.Fprintf(os.Stderr, "Downloading VAD model to %s...\n", dataDir)
-		if err := downloadFile(VADModelURL, vadPath); err != nil {
-			return fmt.Errorf("failed to download VAD model: %w", err)
-		}
-	}
-	return nil
-}
+
 
 func isValidModel(path string) bool {
 	for _, file := range requiredModelFiles {
