@@ -141,7 +141,7 @@ func (p *Pipeline) processAudioInternal(ctx context.Context, samples []float32, 
 	}
 
 	// Apply audio conditioning based on DSP mode
-	audio.ConditionAudioSignal(samples, 0.9, 16000, p.config.DSPMode)
+	audio.ConditionAudioSignal(samples, 0.5, 16000, p.config.DSPMode)
 
 	if p.config.Debug {
 		audio.DebugPlotWaveform(samples, "After DSP")

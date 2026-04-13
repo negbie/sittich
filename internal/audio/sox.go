@@ -17,14 +17,15 @@ func decodeWithSox(ctx context.Context, r io.Reader, extraFlags ...string) ([]fl
 	initialCapacity := 1024 * 1024 // ~1 min of 16kHz float32
 
 	args := []string{
-		"-q", "--no-dither",
 		"-",                                                             // Infile: read from stdin
 		"-t", "raw", "-c", "1", "-e", "floating-point", "-b", "32", "-", // Outfile: write raw float32 to stdout
-		"rate", "-v", "16k",
+		"rate", "-v", "-L", "16k",
 	}
 
 	if len(extraFlags) > 0 {
 		args = append(args, extraFlags...)
+	} else {
+		args = append(args, "silence", "1", "0.1", "1%")
 	}
 
 	cmd := exec.CommandContext(ctx, "sox", args...)

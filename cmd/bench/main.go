@@ -177,90 +177,29 @@ func main() {
 }
 
 func generateSearchSpace() [][]string {
-	fadeOptions := [][]string{
-		{"t", "0.1"},
-		{"t", "0.25"},
-	}
-	vadOptions := [][]string{
-		{}, // None
-		{"-t", "5", "-p", "0.2", "-s", "0.2"},
-		{"-t", "8", "-p", "0.5", "-s", "0.5"},
-	}
-	hpFreqs := []string{"", "20", "40", "80"}
-	gainOptions := [][]string{{}, {"-n"}, {"-n", "-0.1"}, {"-n", "-1.5"}}
+	durations := []string{"0.05", "0.1", "0.3", "0.5"}
+	percents := []string{"0.1%", "0.5%", "1%"}
 
 	var space [][]string
+	for _, d := range durations {
+		for _, p := range percents {
+			silence := []string{"silence", "1", d, p}
 
-	for _, fOpt := range fadeOptions {
-		for _, vOpt := range vadOptions {
-			for _, hpf := range hpFreqs {
-				for _, gOpt := range gainOptions {
-					var effects [][]string
-					effects = append(effects, append([]string{"fade"}, fOpt...))
+			// 1. Just silence
+			space = append(space, silence)
 
-					if len(vOpt) > 0 {
-						effects = append(effects, append([]string{"vad"}, vOpt...))
-					}
-					if hpf != "" {
-						effects = append(effects, []string{"highpass", hpf})
-					}
-					if len(gOpt) > 0 {
-						effects = append(effects, append([]string{"gain"}, gOpt...))
-					}
+			// 2. gain -h at front
+			front := append([]string{"gain", "-h"}, silence...)
+			space = append(space, front)
 
-					// Generate all permutations of the current effects set
-					space = append(space, permutations(effects)...)
-				}
-			}
+			// 3. gain -h at end
+			end := append([]string{}, silence...)
+			end = append(end, "gain", "-h")
+			space = append(space, end)
 		}
 	}
 
 	return space
-}
-
-func permutations(effects [][]string) [][]string {
-	var res [][]string
-	var p func([][]string, int)
-	p = func(arr [][]string, n int) {
-		if n == 1 {
-			// Enforce boundary constraints:
-			// 1. VAD must be AT THE FRONT (index 0)
-			// 2. 'fade' and 'gain' must be at start or end.
-			for i, e := range arr {
-				if len(e) == 0 {
-					continue
-				}
-				if e[0] == "vad" && i != 0 {
-					return
-				}
-				if e[0] == "fade" || e[0] == "gain" {
-					if i > 0 && i < len(arr)-1 {
-						return // Skip if middle position
-					}
-				}
-			}
-
-			tmp := make([]string, 0)
-			for _, e := range arr {
-				tmp = append(tmp, e...)
-			}
-			res = append(res, tmp)
-			return
-		}
-		for i := 0; i < n; i++ {
-			p(arr, n-1)
-			if n%2 == 1 {
-				arr[0], arr[n-1] = arr[n-1], arr[0]
-			} else {
-				arr[i], arr[n-1] = arr[n-1], arr[i]
-			}
-		}
-	}
-	// Copy to avoid modifying original
-	cpy := make([][]string, len(effects))
-	copy(cpy, effects)
-	p(cpy, len(cpy))
-	return res
 }
 
 func callServer(url, filename string, audio []byte, flags []string) (string, time.Duration, error) {
