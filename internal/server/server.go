@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -91,6 +93,23 @@ func (s *Server) withMiddleware(next http.Handler) http.Handler {
 }
 
 func (s *Server) handleTranscribe(w http.ResponseWriter, r *http.Request) {
+	// If the loop-prevention header is present, we ALWAYS process locally.
+	if r.Header.Get("X-Sittich-Proxy-Loop") == "true" {
+		s.processLocalTranscribe(w, r)
+		return
+	}
+
+	// If a proxy is configured, forward the request.
+	if s.options != nil && s.options.Proxy != "" {
+		s.proxyRequest(w, r, s.options.Proxy)
+		return
+	}
+
+	// Default fallback to local processing.
+	s.processLocalTranscribe(w, r)
+}
+
+func (s *Server) processLocalTranscribe(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		s.sendError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
@@ -159,6 +178,33 @@ func (s *Server) handleTranscribe(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, targetURL string) {
+	target, err := url.Parse(targetURL)
+	if err != nil {
+		s.sendError(w, http.StatusInternalServerError, fmt.Sprintf("invalid proxy target: %v", err))
+		return
+	}
+
+	if s.options != nil && s.options.Debug {
+		fmt.Fprintf(os.Stderr, "[HTTP] proxying request to %s\n", targetURL)
+	}
+
+	proxy := &httputil.ReverseProxy{
+		Director: func(req *http.Request) {
+			req.URL.Scheme = target.Scheme
+			req.URL.Host = target.Host
+			req.URL.Path = target.Path
+			req.URL.RawQuery = target.RawQuery
+			req.Host = target.Host
+
+			// Add loop prevention header
+			req.Header.Set("X-Sittich-Proxy-Loop", "true")
+		},
+	}
+
+	proxy.ServeHTTP(w, r)
+}
+
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		s.sendError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -174,6 +220,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		QueueSize:   s.pool.QueueSize(),
 		Workers:     s.pool.TotalWorkers(),
 		BusyWorkers: s.pool.BusyWorkers(),
+		Proxy:       s.options.Proxy,
 	})
 }
 

@@ -36,6 +36,7 @@ type HealthResponse struct {
 	QueueSize   int    `json:"queue_size"`
 	Workers     int    `json:"workers"`
 	BusyWorkers int    `json:"busy_workers"`
+	Proxy       string `json:"proxy,omitempty"`
 }
 
 // RecognizerPool is the interface for the worker pool

@@ -50,6 +50,7 @@ func runServer(opts *cliOptions) error {
 		Workers:      opts.Workers,
 		MaxQueueSize: maxQueue,
 		Debug:        opts.Debug,
+		Proxy:        opts.Proxy,
 	}
 
 	srv := server.NewServer(serverCfg, pool, version)
@@ -58,7 +59,10 @@ func runServer(opts *cliOptions) error {
 	fmt.Fprintf(os.Stderr, "   Concurrency: workers=%d dispatcher=%d max_active=%d num_threads=%d queue=%d (NumCPU=%d)\n",
 		opts.Workers, opts.DispatcherWorkers, cfg.MaxActive, opts.NumThreads, maxQueue, runtime.NumCPU())
 	fmt.Fprintf(os.Stderr, "   Server running on http://%s\n", opts.ListenAddr)
-	fmt.Fprintf(os.Stderr, "   POST /transcribe - Transcribe audio\n")
+	if opts.Proxy != "" {
+		fmt.Fprintf(os.Stderr, "   Proxy mode: ON (target: %s)\n", opts.Proxy)
+	}
+	fmt.Fprintf(os.Stderr, "   POST /transcribe - Transcription endpoint (Proxy-aware)\n")
 	fmt.Fprintf(os.Stderr, "   GET  /health     - Health check\n\nPress Ctrl+C to stop\n")
 
 	errChan := make(chan error, 1)

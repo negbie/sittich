@@ -34,6 +34,7 @@ type cliOptions struct {
 	ShowVersion          bool
 	DataFolder           string
 	DSPMode              string
+	Proxy                string
 }
 
 func defineFlags(fs *flag.FlagSet, opts *cliOptions) {
@@ -52,6 +53,7 @@ func defineFlags(fs *flag.FlagSet, opts *cliOptions) {
 	fs.StringVar(&opts.DecodingMethod, "decoding-method", "greedy_search", "greedy_search or modified_beam_search")
 	fs.StringVar(&opts.DataFolder, "data-folder", "", "path to model directory")
 	fs.StringVar(&opts.DSPMode, "dsp-mode", "aggressive", "DSP chain: minimal, gentle, aggressive")
+	fs.StringVar(&opts.Proxy, "proxy", "", "proxy URL for remote transcription")
 	fs.BoolVar(&opts.Debug, "debug", false, "detailed debug logs")
 	fs.BoolVar(&opts.ShowVersion, "version", false, "show version")
 }

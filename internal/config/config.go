@@ -9,6 +9,7 @@ type Server struct {
 	Debug            bool
 	DefaultFormat    string
 	DefaultChunkSize int
+	Proxy            string
 }
 
 // ASR holds ASR configuration.
