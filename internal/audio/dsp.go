@@ -18,14 +18,14 @@ func ConditionAudioSignal(samples []float32, targetPeak float32, sampleRate int,
 	case "gentle":
 		normalizePeak(samples, targetPeak)
 		applySoftDRC(samples, sampleRate)
-		normalizeLoudness(samples, -15.0)
+		normalizeLoudness(samples, -18.0)
 		applySoftLimiter(samples)
 	case "aggressive":
-		applyPreEmphasis(samples, 0.97)
+		applyPreEmphasis(samples, 0.20)
 		normalizePeak(samples, targetPeak)
 		applyDRC(samples, sampleRate)
-		applyNoiseGate(samples, sampleRate, 0.01)
-		normalizeLoudness(samples, -12.0)
+		applyNoiseGate(samples, sampleRate, 0.001)
+		normalizeLoudness(samples, -16)
 		applySoftLimiter(samples)
 	default:
 	}
@@ -92,10 +92,10 @@ func applySoftDRC(samples []float32, sampleRate int) {
 // applyDRC applies an aggressive compressor with soft-knee.
 func applyDRC(samples []float32, sampleRate int) {
 	const (
-		thresholdDB = -20.0
-		ratio       = 4.0
-		kneeDB      = 4.0
-		attackSec   = 0.005
+		thresholdDB = -24.0
+		ratio       = 1.8
+		kneeDB      = 6.0
+		attackSec   = 0.010
 		releaseSec  = 0.075
 	)
 	attackCoeff := float32(math.Exp(-1.0 / (attackSec * float64(sampleRate))))
@@ -184,8 +184,8 @@ func normalizeLoudness(samples []float32, targetDB float32) {
 
 // applySoftLimiter applies a suave, continuous soft-knee clipper to keep signal <= 0.98.
 func applySoftLimiter(samples []float32) {
-	const threshold = 0.45
-	const margin = 0.6 - threshold // Leave a tiny bit of headroom (-0.17 dB)
+	const threshold = 0.90
+	const margin = 0.99 - threshold // Leave a tiny bit of headroom (-0.08 dB)
 
 	for i, s := range samples {
 		sign := float32(1.0)

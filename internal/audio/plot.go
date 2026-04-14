@@ -66,19 +66,23 @@ func DebugPlotWaveform(samples []float32, title string) {
 	}
 
 	for _, s := range samples {
-		absS := float32(math.Abs(float64(s)))
 		globalRMS += float64(s * s)
-		if absS >= 0.999 {
-			clippedSamples++
-		}
-		if absS >= 0.8 {
-			saturatedSamples++
-		}
 	}
 	globalRMS = math.Sqrt(globalRMS / float64(len(samples)))
 	globalRMSdB := 20 * math.Log10(globalRMS+1e-9)
 	globalPeakdB := 20 * math.Log10(float64(globalPeak)+1e-9)
 	crestFactor := globalPeakdB - globalRMSdB
+
+	// Final check for saturated samples based on the new 0.90 threshold
+	for _, s := range samples {
+		absS := float32(math.Abs(float64(s)))
+		if absS >= 1.0 {
+			clippedSamples++
+		}
+		if absS >= 0.90 {
+			saturatedSamples++
+		}
+	}
 
 	fmt.Fprintf(os.Stderr, "\n   [DSP] %s\n", title)
 	fmt.Fprintf(os.Stderr, "   %-18s %-18s %-18s %-18s\n",
@@ -88,7 +92,7 @@ func DebugPlotWaveform(samples []float32, title string) {
 		fmt.Sprintf("Crest: %.2f dB", crestFactor))
 
 	// Warning indicators
-	if clippedSamples > 0 || saturatedSamples > 0 {
+	if clippedSamples > 0 || saturatedSamples > 100 {
 		warn := "   ⚠️  "
 		if clippedSamples > 0 {
 			warn += fmt.Sprintf("\033[31mCLIPPING DETECTED: %d samples hit 0dBFS!\033[0m ", clippedSamples)
@@ -109,10 +113,16 @@ func DebugPlotWaveform(samples []float32, title string) {
 		grid[i] = make([]bool, totalDotsW)
 	}
 
+	// Scaling factor for visualization
+	visualScale := float32(1.0)
+	if globalPeak > 1.0 {
+		visualScale = globalPeak
+	}
+
 	halfH := float32(totalDotsH) / 2.0
 	for x := 0; x < totalDotsW; x++ {
-		p := peaks[x]
-		r := rmss[x]
+		p := peaks[x] / visualScale
+		r := rmss[x] / visualScale
 
 		// Draw peak spikes (symmetrical about center)
 		pHeight := int(p * halfH)
@@ -161,13 +171,13 @@ func DebugPlotWaveform(samples []float32, title string) {
 	// Render the grid using Braille characters
 	for row := 0; row < charHeight; row++ {
 		var b strings.Builder
-		// Y-axis legend
+		// Y-axis legend (scaled)
 		if row == 0 {
-			b.WriteString("    1.0 ┤")
+			b.WriteString(fmt.Sprintf("   %4.1f ┤", visualScale))
 		} else if row == charHeight/2 {
 			b.WriteString("    0.0 ┼")
 		} else if row == charHeight-1 {
-			b.WriteString("   -1.0 ┤")
+			b.WriteString(fmt.Sprintf("   %4.1f ┤", -visualScale))
 		} else {
 			b.WriteString("        │")
 		}
@@ -208,11 +218,11 @@ func DebugPlotWaveform(samples []float32, title string) {
 				}
 			} else {
 				// Apply coloring based on amplitude
-				if maxAmp > 0.8 {
-					b.WriteString(fmt.Sprintf("\033[31m%c\033[0m", char)) // Red
+				if maxAmp >= 1.0 {
+					b.WriteString(fmt.Sprintf("\033[31m%c\033[0m", char)) // Red (Clipping)
+				} else if maxAmp >= 0.90 {
+					b.WriteString(fmt.Sprintf("\033[33m%c\033[0m", char)) // Yellow (Limiting)
 				} else if maxAmp > 0.4 {
-					b.WriteString(fmt.Sprintf("\033[33m%c\033[0m", char)) // Yellow
-				} else if maxAmp > 0.1 {
 					b.WriteString(fmt.Sprintf("\033[32m%c\033[0m", char)) // Green
 				} else {
 					b.WriteString(fmt.Sprintf("\033[36m%c\033[0m", char)) // Cyan
