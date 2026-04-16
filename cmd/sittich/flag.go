@@ -24,8 +24,6 @@ type cliOptions struct {
 	MaxActivePaths       int
 	MaxActiveStreams     int
 	DecodingMethod       string
-	Workers              int
-	DispatcherWorkers    int
 	NumThreads           int
 	MaxUploadMB          int
 	Debug                bool
@@ -36,8 +34,6 @@ type cliOptions struct {
 
 func defineFlags(fs *flag.FlagSet, opts *cliOptions) {
 	fs.StringVar(&opts.ListenAddr, "listen", ":5092", "listen address")
-	fs.IntVar(&opts.Workers, "workers", 4, "concurrent workers for audio processing")
-	fs.IntVar(&opts.DispatcherWorkers, "dispatcher-workers", 4, "concurrent workers for dispatcher")
 	fs.IntVar(&opts.NumThreads, "num-threads", 2, "ONNX thread pool size per stream")
 	fs.IntVar(&opts.MaxActiveStreams, "max-active-streams", 4, "max concurrent streams (0 = auto)")
 	fs.IntVar(&opts.MaxUploadMB, "max-upload", 16, "max upload size in MB")

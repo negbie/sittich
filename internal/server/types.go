@@ -3,7 +3,7 @@ package server
 import (
 	"context"
 
-	"github.com/negbie/sittich/internal/speech"
+	"github.com/negbie/sittich/internal/asr"
 )
 
 // TranscribeRequest represents a transcription request
@@ -23,7 +23,7 @@ type TranscribeResponse struct {
 	ProcessingTime float64         `json:"processing_time_seconds"`
 	RealtimeFactor float64         `json:"realtime_factor"`
 	Text           string          `json:"text"`
-	Segments       []speech.Segment `json:"segments,omitempty"`
+	Segments       []asr.Segment   `json:"segments,omitempty"`
 }
 
 // HealthResponse represents a health check response
@@ -39,6 +39,6 @@ type HealthResponse struct {
 
 // Recognizer is the interface for ASR recognizer
 type Recognizer interface {
-	Transcribe(ctx context.Context, audio []float32, sampleRate int, opts speech.Options) (*speech.Result, error)
+	Transcribe(ctx context.Context, audio []float32, sampleRate int, opts asr.Options) (*asr.Result, error)
 	Close() error
 }

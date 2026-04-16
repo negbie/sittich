@@ -9,19 +9,19 @@ import (
 	"strings"
 	"time"
 
+	"github.com/negbie/sittich/internal/asr"
 	"github.com/negbie/sittich/internal/audio"
 	"github.com/negbie/sittich/internal/config"
-	"github.com/negbie/sittich/internal/speech"
 )
 
 // Pipeline orchestrates audio processing and transcription.
 type Pipeline struct {
-	Engine speech.Engine
+	Engine asr.Engine
 	Config config.Pipeline
 }
 
 // Process runs the transcription pipeline.
-func (p *Pipeline) Process(ctx context.Context, path string, chunkDuration float64, soxFlags ...string) (*speech.Result, error) {
+func (p *Pipeline) Process(ctx context.Context, path string, chunkDuration float64, soxFlags ...string) (*asr.Result, error) {
 	const targetRate = 16000
 	start := time.Now()
 	
@@ -65,7 +65,7 @@ func (p *Pipeline) Process(ctx context.Context, path string, chunkDuration float
 	}
 
 	if len(asrResults) == 0 {
-		return &speech.Result{Duration: totalDur}, nil
+		return &asr.Result{Duration: totalDur}, nil
 	}
 
 	sort.Slice(asrResults, func(i, j int) bool {
@@ -108,7 +108,7 @@ func (p *Pipeline) transcribeChunks(ctx context.Context, samples []float32, targ
 		return nil, nil
 	}
 
-	opts := speech.Options{
+	opts := asr.Options{
 		Language:       p.Config.Language,
 		WordTimestamps: p.Config.WordTimestamps,
 		Debug:          p.Config.Debug,

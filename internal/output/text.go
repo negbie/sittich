@@ -3,15 +3,11 @@ package output
 import (
 	"fmt"
 	"io"
-	"strings"
 
-	"github.com/negbie/sittich/internal/speech"
+	"github.com/negbie/sittich/internal/asr"
 )
 
-// WriteText writes the transcription in plain text format
-func WriteText(out io.Writer, result *speech.Result) error {
-	for _, seg := range result.Segments {
-		fmt.Fprintln(out, strings.TrimSpace(seg.Text))
-	}
-	return nil
+// WriteText writes the transcription result as plain text.
+func WriteText(w io.Writer, result *asr.Result) {
+	fmt.Fprintln(w, result.FullText())
 }

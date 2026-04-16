@@ -3,25 +3,21 @@ package output
 import (
 	"fmt"
 	"io"
-	"strings"
 	"time"
 
-	"github.com/negbie/sittich/internal/speech"
+	"github.com/negbie/sittich/internal/asr"
 )
 
-// WriteVTT writes the transcription in WebVTT format
-func WriteVTT(out io.Writer, result *speech.Result) error {
-	fmt.Fprintln(out, "WEBVTT")
-	fmt.Fprintln(out)
+// WriteVTT writes the result in WebVTT format.
+func WriteVTT(w io.Writer, result *asr.Result) {
+	fmt.Fprintln(w, "WEBVTT")
+	fmt.Fprintln(w)
 
 	for i, seg := range result.Segments {
-		fmt.Fprintf(out, "%d\n", i+1)
-		fmt.Fprintf(out, "%s --> %s\n", formatVTTTime(seg.Start), formatVTTTime(seg.End))
-		fmt.Fprintln(out, strings.TrimSpace(seg.Text))
-		fmt.Fprintln(out)
+		fmt.Fprintf(w, "%d\n", i+1)
+		fmt.Fprintf(w, "%s --> %s\n", formatVTTTime(seg.Start), formatVTTTime(seg.End))
+		fmt.Fprintf(w, "%s\n\n", seg.Text)
 	}
-
-	return nil
 }
 
 func formatVTTTime(seconds float64) string {
@@ -32,6 +28,5 @@ func formatVTTTime(seconds float64) string {
 	d -= m * time.Minute
 	s := d / time.Second
 	ms := (d - s*time.Second) / time.Millisecond
-
 	return fmt.Sprintf("%02d:%02d:%02d.%03d", h, m, s, ms)
 }

@@ -3,39 +3,36 @@ package main
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
-	"runtime"
 	"syscall"
 	"time"
 
 	"github.com/negbie/sittich/internal/asr"
 	"github.com/negbie/sittich/internal/config"
-	"github.com/negbie/sittich/internal/models"
 	"github.com/negbie/sittich/internal/server"
 )
 
 func runServer(opts *cliOptions) error {
-	fmt.Fprint(os.Stderr, "Loading model...\r")
-	actualDataFolder, err := models.GetModelPath(opts.DataFolder)
-	if err != nil {
-		fmt.Fprintln(os.Stderr)
-		return err
+	asrCfg := &config.ASR{
+		NumThreads:     opts.NumThreads,
+		DecodingMethod: opts.DecodingMethod,
+		MaxActivePaths: opts.MaxActivePaths,
+		MaxActive:      opts.MaxActiveStreams,
+		ModelPath:      opts.DataFolder,
 	}
 
-	cfg := recognizerConfigFromCLI(*opts, actualDataFolder)
-	recognizer, err := server.LoadRecognizer(cfg)
+	recognizer, err := server.LoadRecognizer(asrCfg)
 	if err != nil {
-		fmt.Fprintln(os.Stderr)
 		return err
 	}
 	defer recognizer.Close()
-	fmt.Fprintln(os.Stderr, "Model loaded!   ")
 
-	dispatcher := asr.NewDispatcher(recognizer, opts.DispatcherWorkers, opts.Debug)
+	dispatcher := asr.NewDispatcher(recognizer, opts.MaxActiveStreams, opts.Debug)
 	defer dispatcher.Close()
 
-	pipelineCfg := config.Pipeline{
+	pipeCfg := config.Pipeline{
 		ChunkDuration:        float64(opts.ChunkSize),
 		ChunkOverlapDuration: opts.ChunkOverlapDuration,
 		WordTimestamps:       true,
@@ -43,38 +40,40 @@ func runServer(opts *cliOptions) error {
 	}
 
 	serverCfg := &config.Server{
-		ListenAddr:   opts.ListenAddr,
-		MaxUploadMB:  int64(opts.MaxUploadMB),
-		Workers:      opts.Workers,
-		Debug:        opts.Debug,
-		Proxy:        opts.Proxy,
+		ListenAddr:         opts.ListenAddr,
+		Workers:            opts.MaxActiveStreams,
+		MaxUploadMB:        int64(opts.MaxUploadMB),
+		DefaultFormat:      opts.Format,
+		DefaultChunkSize:   opts.ChunkSize,
+		Proxy:              opts.Proxy,
+		Debug:              opts.Debug,
 	}
 
-	srv := server.NewServer(serverCfg, pipelineCfg, dispatcher, version)
-	srv.SetDefaults(opts.Format, opts.ChunkSize)
+	srv := server.NewServer(serverCfg, pipeCfg, dispatcher, version)
 
-	fmt.Fprintf(os.Stderr, "   Concurrency: workers=%d dispatcher=%d max_active=%d num_threads=%d (NumCPU=%d)\n",
-		opts.Workers, opts.DispatcherWorkers, cfg.MaxActive, opts.NumThreads, runtime.NumCPU())
-	fmt.Fprintf(os.Stderr, "   Server running on http://%s\n", opts.ListenAddr)
-	if opts.Proxy != "" {
-		fmt.Fprintf(os.Stderr, "   Proxy mode: ON (target: %s)\n", opts.Proxy)
-	}
-	fmt.Fprintf(os.Stderr, "   POST /transcribe - Transcription endpoint (Proxy-aware)\n")
-	fmt.Fprintf(os.Stderr, "   GET  /health     - Health check\n\nPress Ctrl+C to stop\n")
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 
-	errChan := make(chan error, 1)
-	go func() { errChan <- srv.Start() }()
+	go func() {
+		fmt.Fprintf(os.Stderr, "Model loaded!   \n")
+		fmt.Fprintf(os.Stderr, "   Concurrency: workers=%d dispatcher=%d max_active=%d num_threads=%d (NumCPU=%s)\n", 
+			opts.MaxActiveStreams, opts.MaxActiveStreams, opts.MaxActiveStreams, opts.NumThreads, os.Getenv("NUM_CPU"))
+		fmt.Fprintf(os.Stderr, "   Server running on http://%s\n", opts.ListenAddr)
+		fmt.Fprintf(os.Stderr, "   POST /transcribe - Transcription endpoint (Proxy-aware)\n")
+		fmt.Fprintf(os.Stderr, "   GET  /health     - Health check\n\n")
+		fmt.Fprintf(os.Stderr, "Press Ctrl+C to stop\n")
 
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+		if err := srv.Start(); err != nil && err != http.ErrServerClosed {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+	}()
 
-	select {
-	case err := <-errChan:
-		return err
-	case <-sigChan:
-		fmt.Fprintln(os.Stderr, "\n Shutting down...")
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		return srv.Shutdown(ctx)
-	}
+	<-stop
+	fmt.Fprintf(os.Stderr, "\n Shutting down...\n")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	return srv.Shutdown(ctx)
 }

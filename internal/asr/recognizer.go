@@ -4,12 +4,12 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	sherpa "github.com/k2-fsa/sherpa-onnx-go/sherpa_onnx"
 	"github.com/negbie/sittich/internal/config"
 	"github.com/negbie/sittich/internal/models"
-	"github.com/negbie/sittich/internal/speech"
 )
 
 // Recognizer wraps the Sherpa-ONNX engine with concurrency control.
@@ -35,9 +35,9 @@ func NewRecognizer(cfg *config.ASR) (*Recognizer, error) {
 				Decoder: filepath.Join(cfg.ModelPath, models.DecoderFile),
 				Joiner:  filepath.Join(cfg.ModelPath, models.JoinerFile),
 			},
-			Tokens:    filepath.Join(cfg.ModelPath, models.TokensFile),
-			Provider:  "cpu",
-			ModelType: "nemo_transducer",
+			Tokens:     filepath.Join(cfg.ModelPath, models.TokensFile),
+			Provider:   "cpu",
+			ModelType:  "nemo_transducer",
 			NumThreads: cfg.NumThreads,
 		},
 		DecodingMethod: cfg.DecodingMethod,
@@ -60,20 +60,20 @@ func NewRecognizer(cfg *config.ASR) (*Recognizer, error) {
 }
 
 // Transcribe handles a single audio chunk.
-func (r *Recognizer) Transcribe(ctx context.Context, audio []float32, sampleRate int, opts speech.Options) (*speech.Result, error) {
+func (r *Recognizer) Transcribe(ctx context.Context, audio []float32, sampleRate int, opts Options) (*Result, error) {
 	results, err := r.TranscribeBatch(ctx, [][]float32{audio}, sampleRate, opts)
 	if err != nil {
 		return nil, err
 	}
 	if len(results) == 0 {
-		return &speech.Result{}, nil
+		return &Result{}, nil
 	}
 	return results[0], nil
 }
 
 // TranscribeBatch handles multiple chunks. It uses a semaphore to limit concurrent 
 // ONNX decodes, preventing unbounded memory growth in the runtime arena.
-func (r *Recognizer) TranscribeBatch(ctx context.Context, chunks [][]float32, sampleRate int, opts speech.Options) ([]*speech.Result, error) {
+func (r *Recognizer) TranscribeBatch(ctx context.Context, chunks [][]float32, sampleRate int, opts Options) ([]*Result, error) {
 	if r == nil || r.recognizer == nil {
 		return nil, fmt.Errorf("asr: recognizer is nil or closed")
 	}
@@ -117,17 +117,21 @@ func (r *Recognizer) TranscribeBatch(ctx context.Context, chunks [][]float32, sa
 		r.mu.Unlock()
 	}()
 
-	results := make([]*speech.Result, len(streams))
+	results := make([]*Result, len(streams))
 	for i, s := range streams {
 		res := s.GetResult()
 		duration := float64(len(chunks[i])) / float64(sampleRate)
 		
-		out := &speech.Result{Duration: duration}
+		out := &Result{Duration: duration}
 		if res != nil {
-			seg := speech.Segment{End: duration, Text: res.Text}
+			cleanText := strings.ReplaceAll(res.Text, "\u2581", " ")
+			seg := Segment{
+				End:  duration,
+				Text: strings.TrimSpace(cleanText),
+			}
 			if len(res.Timestamps) > 0 {
 				n := min(len(res.Tokens), len(res.Timestamps))
-				seg.Words = make([]speech.Word, n)
+				seg.Words = make([]Word, n)
 				for j := range n {
 					start := float64(res.Timestamps[j])
 					end := start + 0.1
@@ -136,10 +140,10 @@ func (r *Recognizer) TranscribeBatch(ctx context.Context, chunks [][]float32, sa
 							end = next
 						}
 					}
-					seg.Words[j] = speech.Word{Word: res.Tokens[j], Start: start, End: end}
+					seg.Words[j] = Word{Word: res.Tokens[j], Start: start, End: end}
 				}
 			}
-			out.Segments = []speech.Segment{seg}
+			out.Segments = []Segment{seg}
 		}
 		results[i] = out
 	}
