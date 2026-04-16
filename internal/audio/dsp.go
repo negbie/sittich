@@ -4,33 +4,21 @@ import (
 	"math"
 )
 
-// ConditionAudioSignal applies DSP conditioning to audio samples before ASR inference
-func ConditionAudioSignal(samples []float32, targetPeak float32, sampleRate int, mode string) {
+// ConditionAudioSignal prepares audio for ASR by applying a fixed high-quality DSP chain:
+// Pre-emphasis -> DRC -> Noise Gate -> Loudness Normalization -> Soft Limiter.
+func ConditionAudioSignal(samples []float32, sampleRate int) {
 	if len(samples) == 0 {
 		return
 	}
 
 	removeDCOffset(samples)
-
-	switch mode {
-	case "minimal":
-		normalizePeak(samples, targetPeak)
-	case "gentle":
-		normalizePeak(samples, targetPeak)
-		applySoftDRC(samples, sampleRate)
-		normalizeLoudness(samples, -18.0)
-		applySoftLimiter(samples)
-	case "aggressive":
-		applyPreEmphasis(samples, 0.20)
-		normalizePeak(samples, targetPeak)
-		applyDRC(samples, sampleRate)
-		applyNoiseGate(samples, sampleRate, 0.001)
-		normalizeLoudness(samples, -16)
-		applySoftLimiter(samples)
-	default:
-	}
-
+	applyPreEmphasis(samples, 0.10)
+	applyDRC(samples, sampleRate)
+	applyNoiseGate(samples, sampleRate, 0.001)
+	normalizeLoudness(samples, -16)
+	applySoftLimiter(samples)
 }
+
 func removeDCOffset(samples []float32) {
 	var sum float64
 	for _, s := range samples {
@@ -48,48 +36,7 @@ func applyPreEmphasis(samples []float32, alpha float32) {
 	}
 }
 
-// applySoftDRC applies a gentle 2:1 compressor at -30 dBFS for leveling
-// varied input without squashing natural speech dynamics.
-func applySoftDRC(samples []float32, sampleRate int) {
-	const (
-		thresholdDB = -30.0
-		ratio       = 2.0
-		kneeDB      = 6.0 // 6dB soft knee
-		attackSec   = 0.005
-		releaseSec  = 0.1
-	)
-	attackCoeff := float32(math.Exp(-1.0 / (attackSec * float64(sampleRate))))
-	releaseCoeff := float32(math.Exp(-1.0 / (releaseSec * float64(sampleRate))))
-
-	var envelope float32
-	for i, s := range samples {
-		input := float32(math.Abs(float64(s)))
-		if input > envelope {
-			envelope = attackCoeff*envelope + (1-attackCoeff)*input
-		} else {
-			envelope = releaseCoeff*envelope + (1-releaseCoeff)*input
-		}
-
-		if envelope < 1e-6 {
-			continue
-		}
-
-		envDB := 20.0 * math.Log10(float64(envelope))
-		var gainReductionDB float32
-		if envDB > thresholdDB+(float64(kneeDB)/2.0) {
-			gainReductionDB = float32((thresholdDB - envDB) * (1.0 - 1.0/ratio))
-		} else if envDB > thresholdDB-(float64(kneeDB)/2.0) {
-			// Soft-knee region
-			diff := envDB - (thresholdDB - float64(kneeDB)/2.0)
-			gainReductionDB = float32(-0.5 * (1.0 - 1.0/ratio) * diff * diff / float64(kneeDB))
-		}
-
-		gainReduction := float32(math.Pow(10, float64(gainReductionDB)/20.0))
-		samples[i] = s * gainReduction
-	}
-}
-
-// applyDRC applies an aggressive compressor with soft-knee.
+// applyDRC applies an aggressive compressor with soft-knee to level speech dynamics.
 func applyDRC(samples []float32, sampleRate int) {
 	const (
 		thresholdDB = -24.0
@@ -128,27 +75,8 @@ func applyDRC(samples []float32, sampleRate int) {
 	}
 }
 
-func normalizePeak(samples []float32, targetPeak float32) {
-	var peak float32
-	for _, s := range samples {
-		abs := float32(math.Abs(float64(s)))
-		if abs > peak {
-			peak = abs
-		}
-	}
-
-	if peak == 0 || math.Abs(float64(peak-targetPeak)) < 0.01 {
-		return
-	}
-
-	multiplier := targetPeak / peak
-	for i := range samples {
-		samples[i] *= multiplier
-	}
-}
-
 // normalizeLoudness normalizes the audio to a target RMS loudness (in dBFS),
-// keeping typical ASR models in their sweet spot (e.g. -16 to -20 dBFS).
+// keeping the signal in the model's optimal dynamic range.
 func normalizeLoudness(samples []float32, targetDB float32) {
 	if len(samples) == 0 {
 		return
@@ -160,16 +88,14 @@ func normalizeLoudness(samples []float32, targetDB float32) {
 	}
 	rms := float32(math.Sqrt(sumSquares / float64(len(samples))))
 
-	// Silence protection: if signal is below -60 dBFS RMS, assume silence.
-	if rms < 0.001 {
+	if rms < 0.001 { // Silence protection
 		return
 	}
 
 	targetRMS := float32(math.Pow(10, float64(targetDB)/20.0))
 	multiplier := targetRMS / rms
 
-	// Gain limits: Never boost more than 10x (+20dB) to avoid blasting noise.
-	// Never reduce more than 10x (-20dB) to prevent complete silencing.
+	// Limit gain changes to +/- 20dB
 	if multiplier > 10.0 {
 		multiplier = 10.0
 	} else if multiplier < 0.1 {
@@ -177,15 +103,14 @@ func normalizeLoudness(samples []float32, targetDB float32) {
 	}
 
 	for i := range samples {
-		val := samples[i] * multiplier
-		samples[i] = val
+		samples[i] *= multiplier
 	}
 }
 
-// applySoftLimiter applies a suave, continuous soft-knee clipper to keep signal <= 0.98.
+// applySoftLimiter applies a suave, continuous soft-knee clipper to prevent clipping beyond -0.08 dBFS.
 func applySoftLimiter(samples []float32) {
 	const threshold = 0.90
-	const margin = 0.99 - threshold // Leave a tiny bit of headroom (-0.08 dB)
+	const margin = 0.99 - threshold
 
 	for i, s := range samples {
 		sign := float32(1.0)
@@ -200,7 +125,6 @@ func applySoftLimiter(samples []float32) {
 		}
 
 		// Continuous soft-knee formula: y = T + (M-T) * tanh((x-T)/(M-T))
-		// This is perfectly smooth (C-infinity) at s=threshold and asymptotes to 1.0.
 		res := threshold + margin*float32(math.Tanh(float64((absS-threshold)/margin)))
 		samples[i] = sign * res
 	}
@@ -209,8 +133,8 @@ func applySoftLimiter(samples []float32) {
 // applyNoiseGate applies a smooth noise gate using an RMS-based envelope.
 func applyNoiseGate(samples []float32, sampleRate int, threshold float32) {
 	const (
-		attackSec  = 0.01 // 10ms
-		releaseSec = 0.1  // 100ms
+		attackSec  = 0.01 
+		releaseSec = 0.1  
 	)
 	attackCoeff := float32(math.Exp(-1.0 / (attackSec * float64(sampleRate))))
 	releaseCoeff := float32(math.Exp(-1.0 / (releaseSec * float64(sampleRate))))

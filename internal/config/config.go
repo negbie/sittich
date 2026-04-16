@@ -5,7 +5,6 @@ type Server struct {
 	ListenAddr       string
 	MaxUploadMB      int64
 	Workers          int
-	MaxQueueSize     int
 	Debug            bool
 	DefaultFormat    string
 	DefaultChunkSize int
@@ -39,7 +38,4 @@ type Pipeline struct {
 
 	// Debug enables detailed console logging.
 	Debug bool
-
-	// DSPMode selects the audio conditioning chain: "minimal", "gentle", "aggressive".
-	DSPMode string
 }

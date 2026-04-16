@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -20,24 +19,28 @@ import (
 	"github.com/negbie/sittich/internal/config"
 	"github.com/negbie/sittich/internal/models"
 	"github.com/negbie/sittich/internal/output"
+	"github.com/negbie/sittich/internal/pipeline"
 	"github.com/negbie/sittich/internal/speech"
-	"github.com/negbie/sittich/internal/worker"
 )
 
 // Server is the HTTP server
 type Server struct {
 	httpServer *http.Server
-	pool       RecognizerPool
+	engine     speech.Engine
 	options    *config.Server
+	pipeline   config.Pipeline
+	sem        chan struct{}
 	version    string
 	startTime  time.Time
 }
 
 // NewServer creates a new HTTP server
-func NewServer(options *config.Server, pool RecognizerPool, version string) *Server {
+func NewServer(options *config.Server, pipeline config.Pipeline, engine speech.Engine, version string) *Server {
 	s := &Server{
-		pool:      pool,
+		engine:    engine,
 		options:   options,
+		pipeline:  pipeline,
+		sem:       make(chan struct{}, options.Workers),
 		version:   version,
 		startTime: time.Now(),
 	}
@@ -122,6 +125,7 @@ func (s *Server) processLocalTranscribe(w http.ResponseWriter, r *http.Request) 
 		s.sendError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	defer cleanup()
 
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
 	defer cancel()
@@ -130,52 +134,49 @@ func (s *Server) processLocalTranscribe(w http.ResponseWriter, r *http.Request) 
 		fmt.Fprintf(os.Stderr, "[HTTP] parse_request=%s format=%s chunk_size=%d\n", time.Since(requestStart).Round(time.Millisecond), format, chunkSize)
 	}
 
-	job := &worker.Job{
-		ID:        strconv.FormatInt(time.Now().UnixNano(), 10),
-		FilePath:  filePath,
-		Format:    format,
-		ChunkSize: chunkSize,
-		SoxFlags:  soxFlags,
-		Done:      make(chan worker.JobDone, 1),
-		StartTime: time.Now(),
-		Ctx:       ctx,
-	}
-
-	if err := s.pool.Submit(job); err != nil {
-		if cleanup != nil {
-			cleanup()
-		}
-		s.sendError(w, http.StatusServiceUnavailable, err.Error())
+	// Acquire a worker slot. This provides backpressure and limits concurrent DSP/ASR.
+	select {
+	case s.sem <- struct{}{}:
+		defer func() { <-s.sem }()
+	case <-ctx.Done():
+		s.sendError(w, http.StatusServiceUnavailable, "server too busy")
 		return
 	}
+
+	jobID := strconv.FormatInt(time.Now().UnixNano(), 10)
 	if s.options != nil && s.options.Debug {
-		fmt.Fprintf(os.Stderr, "[HTTP] submit_job=%s job_id=%s\n", time.Since(requestStart).Round(time.Millisecond), job.ID)
+		fmt.Fprintf(os.Stderr, "[HTTP] job_start=%s job_id=%s\n", time.Since(requestStart).Round(time.Millisecond), jobID)
 	}
 
-	select {
-	case done := <-job.Done:
-		if done.Err != nil {
-			if s.options != nil && s.options.Debug {
-				fmt.Fprintf(os.Stderr, "[HTTP] request_failed=%s job_id=%s err=%v\n", time.Since(requestStart).Round(time.Millisecond), job.ID, done.Err)
-			}
-			s.sendError(w, http.StatusInternalServerError, done.Err.Error())
-			return
-		}
-		if s.options != nil && s.options.Debug {
-			fmt.Fprintf(os.Stderr, "[HTTP] request_done=%s job_id=%s\n", time.Since(requestStart).Round(time.Millisecond), job.ID)
-		}
-		s.sendFormattedResponse(w, format, *done.Result)
-	case <-ctx.Done():
-		if cleanup != nil {
-			cleanup()
-		}
-		if s.options != nil && s.options.Debug {
-			fmt.Fprintf(os.Stderr, "[HTTP] request_cancelled=%s job_id=%s err=%v\n", time.Since(requestStart).Round(time.Millisecond), job.ID, ctx.Err())
-		}
-		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			s.sendError(w, http.StatusRequestTimeout, "transcription timeout")
-		}
+	// Initialise a temporary Pipeline for this request.
+	pipe := &pipeline.Pipeline{
+		Engine: s.engine,
+		Config: s.pipeline,
 	}
+
+	startTime := time.Now()
+	result, err := pipe.Process(ctx, filePath, float64(chunkSize), soxFlags...)
+	if err != nil {
+		if s.options != nil && s.options.Debug {
+			fmt.Fprintf(os.Stderr, "[HTTP] job_failed=%s job_id=%s err=%v\n", time.Since(requestStart).Round(time.Millisecond), jobID, err)
+		}
+		s.sendError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	processingTime := time.Since(startTime).Seconds()
+	rtFactor := result.Duration / processingTime
+	if rtFactor < 0 {
+		rtFactor = 0
+	}
+
+	if s.options != nil && s.options.Debug {
+		processingElapsed := time.Since(startTime).Round(time.Millisecond)
+		totalElapsed := time.Since(requestStart).Round(time.Millisecond)
+		fmt.Fprintf(os.Stderr, "[HTTP] job_done=%s job_id=%s processing_time=%s total_time=%s rtf=%.2f\n", jobID, time.Since(startTime).Round(time.Millisecond), processingElapsed, totalElapsed, rtFactor)
+	}
+
+	s.sendFormattedResponse(w, format, result, processingTime, rtFactor)
 }
 
 func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, targetURL string) {
@@ -217,9 +218,8 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		ModelLoaded: true,
 		Version:     s.version,
 		Uptime:      uptime.Round(time.Second).String(),
-		QueueSize:   s.pool.QueueSize(),
-		Workers:     s.pool.TotalWorkers(),
-		BusyWorkers: s.pool.BusyWorkers(),
+		Workers:     cap(s.sem),
+		BusyWorkers: len(s.sem),
 		Proxy:       s.options.Proxy,
 	})
 }
@@ -412,13 +412,7 @@ func (s *Server) sendError(w http.ResponseWriter, status int, message string) {
 	})
 }
 
-func (s *Server) sendFormattedResponse(w http.ResponseWriter, format string, jr worker.JobResult) {
-	// Create a speech.Result from JobResult for the output package
-	result := &speech.Result{
-		Duration: jr.Duration,
-		Segments: jr.Segments,
-	}
-
+func (s *Server) sendFormattedResponse(w http.ResponseWriter, format string, result *speech.Result, processingTime, rtFactor float64) {
 	switch format {
 	case "text":
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -431,11 +425,11 @@ func (s *Server) sendFormattedResponse(w http.ResponseWriter, format string, jr 
 	default: // json
 		s.sendJSON(w, http.StatusOK, TranscribeResponse{
 			Success:        true,
-			Duration:       jr.Duration,
-			ProcessingTime: jr.ProcessingTime,
-			RealtimeFactor: jr.RealtimeFactor,
-			Text:           jr.Text,
-			Segments:       jr.Segments,
+			Duration:       result.Duration,
+			ProcessingTime: processingTime,
+			RealtimeFactor: rtFactor,
+			Text:           result.FullText(),
+			Segments:       result.Segments,
 		})
 	}
 }

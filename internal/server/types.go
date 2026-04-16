@@ -4,7 +4,6 @@ import (
 	"context"
 
 	"github.com/negbie/sittich/internal/speech"
-	"github.com/negbie/sittich/internal/worker"
 )
 
 // TranscribeRequest represents a transcription request
@@ -33,19 +32,9 @@ type HealthResponse struct {
 	ModelLoaded bool   `json:"model_loaded"`
 	Version     string `json:"version"`
 	Uptime      string `json:"uptime"`
-	QueueSize   int    `json:"queue_size"`
 	Workers     int    `json:"workers"`
 	BusyWorkers int    `json:"busy_workers"`
 	Proxy       string `json:"proxy,omitempty"`
-}
-
-// RecognizerPool is the interface for the worker pool
-type RecognizerPool interface {
-	Submit(job *worker.Job) error
-	QueueSize() int
-	BusyWorkers() int
-	TotalWorkers() int
-	Shutdown()
 }
 
 // Recognizer is the interface for ASR recognizer

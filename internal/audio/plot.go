@@ -10,7 +10,6 @@ import (
 // DebugPlotWaveform prints a high-resolution Braille waveform graph to the terminal.
 func DebugPlotWaveform(samples []float32, title string) {
 	if len(samples) == 0 {
-		fmt.Fprintf(os.Stderr, "   [DSP] %s: No samples to plot\n", title)
 		return
 	}
 
@@ -103,9 +102,6 @@ func DebugPlotWaveform(samples []float32, title string) {
 		}
 		fmt.Fprintln(os.Stderr, warn)
 	}
-	if crestFactor < 9.0 {
-		fmt.Fprintf(os.Stderr, "   💡 \033[35mADVICE: Crest Factor is low (%.2f dB). Audio is very 'squashed/screamy'.\033[0m\n", crestFactor)
-	}
 
 	// Drawing buffer: grid of bits for each dot
 	grid := make([][]bool, totalDotsH)
@@ -183,11 +179,6 @@ func DebugPlotWaveform(samples []float32, title string) {
 		}
 
 		for col := 0; col < charWidth; col++ {
-			// Braille dots numbering:
-			// 1 4
-			// 2 5
-			// 3 6
-			// 7 8
 			char := rune(0x2800)
 			dots := []struct {
 				dx, dy int

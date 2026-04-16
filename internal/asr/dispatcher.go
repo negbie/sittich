@@ -5,58 +5,42 @@ import (
 	"fmt"
 	"os"
 	"sync"
-	"time"
 
 	"github.com/negbie/sittich/internal/speech"
 )
 
-// Dispatcher implements a global ASR job queue with cross-request batching.
+// Dispatcher implements a bounded parallel ASR execution planner.
 // It satisfies the speech.Engine interface by delegating to an underlying
-// recognizer while aggregating small transcription calls into larger batches.
+// recognizer while managing concurrent execution of size-1 micro-batches.
 type Dispatcher struct {
-	engine    speech.Engine
-	jobChan   chan *asrJob
-	batchSize int
-	window    time.Duration
-	wg        sync.WaitGroup
-	ctx       context.Context
-	cancel    context.CancelFunc
-	closeOnce sync.Once
-	debug     bool
+	engine speech.Engine
+	sem    chan struct{}
+	ctx    context.Context
+	cancel context.CancelFunc
+	debug  bool
 }
 
-type asrJob struct {
-	audio      []float32
-	sampleRate int
-	opts       speech.Options
-	resultChan chan batchResult
-	ctx        context.Context
-}
+// NewDispatcher creates a new ASR dispatcher that implements bounded 
+// parallel execution of size-1 micro-batches.
+func NewDispatcher(engine speech.Engine, workers int, debug bool) *Dispatcher {
+	// Architecture recommends max 4 parallel decodes per request/instance
+	// to avoid ONNX runtime penalties.
+	maxParallel := workers
+	if maxParallel > 4 {
+		maxParallel = 4
+	}
+	if maxParallel < 1 {
+		maxParallel = 1
+	}
 
-type batchResult struct {
-	res *speech.Result
-	err error
-}
-
-// NewDispatcher creates a new global ASR dispatcher.
-func NewDispatcher(engine speech.Engine, workers int, batchSize int, window time.Duration, debug bool) *Dispatcher {
 	ctx, cancel := context.WithCancel(context.Background())
-	d := &Dispatcher{
-		engine:    engine,
-		jobChan:   make(chan *asrJob, 512),
-		batchSize: batchSize,
-		window:    window,
-		ctx:       ctx,
-		cancel:    cancel,
-		debug:     debug,
+	return &Dispatcher{
+		engine: engine,
+		sem:    make(chan struct{}, maxParallel),
+		ctx:    ctx,
+		cancel: cancel,
+		debug:  debug,
 	}
-
-	for i := 0; i < workers; i++ {
-		d.wg.Add(1)
-		go d.worker(i)
-	}
-
-	return d
 }
 
 // Transcribe satisfies the speech.Engine interface.
@@ -71,53 +55,51 @@ func (d *Dispatcher) Transcribe(ctx context.Context, audio []float32, sampleRate
 	return results[0], nil
 }
 
-// TranscribeBatch satisfies the speech.Engine interface. It decomposes the
-// batch into individual jobs and collects them back after the dispatcher
-// processes them (potentially alongside jobs from other requests).
+// TranscribeBatch satisfies the speech.Engine interface. It implements
+// bounded internal parallelism with micro-batch size 1.
 func (d *Dispatcher) TranscribeBatch(ctx context.Context, chunks [][]float32, sampleRate int, opts speech.Options) ([]*speech.Result, error) {
 	n := len(chunks)
 	if n == 0 {
 		return nil, nil
 	}
 
-	type pendingResult struct {
-		ch  chan batchResult
-		idx int
-	}
-	pending := make([]pendingResult, n)
-
-	for i, chunk := range chunks {
-		ch := make(chan batchResult, 1)
-		job := &asrJob{
-			audio:      chunk,
-			sampleRate: sampleRate,
-			opts:       opts,
-			resultChan: ch,
-			ctx:        ctx,
-		}
-		pending[i] = pendingResult{ch: ch, idx: i}
-
-		select {
-		case d.jobChan <- job:
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-d.ctx.Done():
-			return nil, fmt.Errorf("dispatcher closed")
-		}
+	if d.debug {
+		fmt.Fprintf(os.Stderr, "   [Dispatcher] dispatching_batch size=%d chunks=%d\n", n, n)
 	}
 
 	results := make([]*speech.Result, n)
-	for _, p := range pending {
-		select {
-		case res := <-p.ch:
-			if res.err != nil {
-				return nil, res.err
+	errs := make([]error, n)
+
+	var wg sync.WaitGroup
+	for i := range chunks {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+
+			// Acquire concurrency slot
+			select {
+			case d.sem <- struct{}{}:
+				defer func() { <-d.sem }()
+			case <-ctx.Done():
+				errs[idx] = ctx.Err()
+				return
+			case <-d.ctx.Done():
+				errs[idx] = fmt.Errorf("dispatcher closed")
+				return
 			}
-			results[p.idx] = res.res
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-d.ctx.Done():
-			return nil, fmt.Errorf("dispatcher closed")
+
+			// Execute size-1 micro-batch
+			res, err := d.engine.Transcribe(ctx, chunks[idx], sampleRate, opts)
+			results[idx] = res
+			errs[idx] = err
+		}(i)
+	}
+
+	wg.Wait()
+
+	for _, err := range errs {
+		if err != nil {
+			return nil, err
 		}
 	}
 
@@ -127,94 +109,6 @@ func (d *Dispatcher) TranscribeBatch(ctx context.Context, chunks [][]float32, sa
 func (d *Dispatcher) SupportedLanguages() []string { return d.engine.SupportedLanguages() }
 func (d *Dispatcher) ModelName() string            { return d.engine.ModelName() }
 func (d *Dispatcher) Close() error {
-	d.closeOnce.Do(func() {
-		d.cancel()
-		close(d.jobChan)
-		d.wg.Wait()
-	})
+	d.cancel()
 	return d.engine.Close()
-}
-
-func (d *Dispatcher) worker(id int) {
-	defer d.wg.Done()
-
-	for {
-		var batch []*asrJob
-
-		// 1. Wait for first job (blocking)
-		select {
-		case <-d.ctx.Done():
-			return
-		case job, ok := <-d.jobChan:
-			if !ok {
-				return
-			}
-			batch = append(batch, job)
-		}
-
-		// 2. Greedy Drain & Wait-and-Batch
-			// Stage 1: Zero-latency greedy drain.
-			// Pull any jobs already waiting in the channel to fill the batch immediately
-			// without introducing any artificial delay.
-	GreedyLoop:
-		for len(batch) < d.batchSize {
-			select {
-			case nextJob, ok := <-d.jobChan:
-				if !ok {
-					break GreedyLoop
-				}
-				batch = append(batch, nextJob)
-			default:
-				// No more jobs currently buffered in the channel.
-				break GreedyLoop
-			}
-		}
-
-		// Stage 2: Windowed wait.
-		// If the batch is still not full, start a short timer to wait for incoming jobs.
-		// This balances throughput (larger batches) vs. latency (maximum wait time).
-		if len(batch) < d.batchSize {
-			timer := time.NewTimer(d.window)
-
-		BatchLoop:
-			for len(batch) < d.batchSize {
-				select {
-				case <-d.ctx.Done():
-					timer.Stop()
-					return
-				case nextJob, ok := <-d.jobChan:
-					if !ok {
-						break BatchLoop
-					}
-					batch = append(batch, nextJob)
-				case <-timer.C:
-					break BatchLoop
-				}
-			}
-			timer.Stop()
-		}
-
-		// 3. Execute Batch
-		if d.debug {
-			fmt.Fprintf(os.Stderr, "   [Dispatcher] worker=%d dispatching_batch size=%d\n", id, len(batch))
-		}
-
-		audioChunks := make([][]float32, len(batch))
-		for i, j := range batch {
-			audioChunks[i] = j.audio
-		}
-
-		// We assume all chunks in the batch have the same sample rate and options
-		// as the first one. In sittich this is currently always true (16kHz).
-		results, err := d.engine.TranscribeBatch(d.ctx, audioChunks, batch[0].sampleRate, batch[0].opts)
-
-		// 4. Distribute Results
-		for i, j := range batch {
-			if err != nil {
-				j.resultChan <- batchResult{err: err}
-				continue
-			}
-			j.resultChan <- batchResult{res: results[i]}
-		}
-	}
 }

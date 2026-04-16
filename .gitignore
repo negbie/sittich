@@ -16,6 +16,8 @@ go.work
 # Dependency directories (remove when vendoring)
 vendor/
 
+docs/
+
 # IDE
 .idea/
 .vscode/

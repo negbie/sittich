@@ -13,7 +13,6 @@ import (
 	"github.com/negbie/sittich/internal/config"
 	"github.com/negbie/sittich/internal/models"
 	"github.com/negbie/sittich/internal/server"
-	"github.com/negbie/sittich/internal/worker"
 )
 
 func runServer(opts *cliOptions) error {
@@ -33,31 +32,29 @@ func runServer(opts *cliOptions) error {
 	defer recognizer.Close()
 	fmt.Fprintln(os.Stderr, "Model loaded!   ")
 
-	dispatcher := asr.NewDispatcher(recognizer, opts.DispatcherWorkers, opts.MaxBatchSize, 5*time.Millisecond, opts.Debug)
+	dispatcher := asr.NewDispatcher(recognizer, opts.DispatcherWorkers, opts.Debug)
 	defer dispatcher.Close()
 
-	maxQueue := opts.MaxQueueSize
-	if maxQueue <= 0 {
-		maxQueue = opts.Workers * 2
+	pipelineCfg := config.Pipeline{
+		ChunkDuration:        float64(opts.ChunkSize),
+		ChunkOverlapDuration: opts.ChunkOverlapDuration,
+		WordTimestamps:       true,
+		Debug:                opts.Debug,
 	}
-
-	pool := setupPool(opts, dispatcher, actualDataFolder, maxQueue)
-	defer pool.Shutdown()
 
 	serverCfg := &config.Server{
 		ListenAddr:   opts.ListenAddr,
 		MaxUploadMB:  int64(opts.MaxUploadMB),
 		Workers:      opts.Workers,
-		MaxQueueSize: maxQueue,
 		Debug:        opts.Debug,
 		Proxy:        opts.Proxy,
 	}
 
-	srv := server.NewServer(serverCfg, pool, version)
+	srv := server.NewServer(serverCfg, pipelineCfg, dispatcher, version)
 	srv.SetDefaults(opts.Format, opts.ChunkSize)
 
-	fmt.Fprintf(os.Stderr, "   Concurrency: workers=%d dispatcher=%d max_active=%d num_threads=%d queue=%d (NumCPU=%d)\n",
-		opts.Workers, opts.DispatcherWorkers, cfg.MaxActive, opts.NumThreads, maxQueue, runtime.NumCPU())
+	fmt.Fprintf(os.Stderr, "   Concurrency: workers=%d dispatcher=%d max_active=%d num_threads=%d (NumCPU=%d)\n",
+		opts.Workers, opts.DispatcherWorkers, cfg.MaxActive, opts.NumThreads, runtime.NumCPU())
 	fmt.Fprintf(os.Stderr, "   Server running on http://%s\n", opts.ListenAddr)
 	if opts.Proxy != "" {
 		fmt.Fprintf(os.Stderr, "   Proxy mode: ON (target: %s)\n", opts.Proxy)
@@ -80,21 +77,4 @@ func runServer(opts *cliOptions) error {
 		defer cancel()
 		return srv.Shutdown(ctx)
 	}
-}
-
-func setupPool(opts *cliOptions, dispatcher *asr.Dispatcher, dataFolder string, queueSize int) *worker.Pool {
-	return worker.NewPool(
-		opts.Workers,
-		queueSize,
-		dispatcher,
-		config.Pipeline{
-			ChunkDuration:        float64(opts.ChunkSize),
-			ChunkOverlapDuration: opts.ChunkOverlapDuration,
-			WordTimestamps:       true,
-			Debug:                opts.Debug,
-			DSPMode:              opts.DSPMode,
-		},
-		opts.Debug,
-		dataFolder,
-	)
 }
