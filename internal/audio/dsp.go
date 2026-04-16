@@ -12,7 +12,6 @@ func ConditionAudioSignal(samples []float32, sampleRate int) {
 	}
 
 	removeDCOffset(samples)
-	applyPreEmphasis(samples, 0.10)
 	applyDRC(samples, sampleRate)
 	applyNoiseGate(samples, sampleRate, 0.001)
 	normalizeLoudness(samples, -16)
@@ -27,12 +26,6 @@ func removeDCOffset(samples []float32) {
 	mean := float32(sum / float64(len(samples)))
 	for i := range samples {
 		samples[i] -= mean
-	}
-}
-
-func applyPreEmphasis(samples []float32, alpha float32) {
-	for i := len(samples) - 1; i > 0; i-- {
-		samples[i] = samples[i] - alpha*samples[i-1]
 	}
 }
 
@@ -133,8 +126,8 @@ func applySoftLimiter(samples []float32) {
 // applyNoiseGate applies a smooth noise gate using an RMS-based envelope.
 func applyNoiseGate(samples []float32, sampleRate int, threshold float32) {
 	const (
-		attackSec  = 0.01 
-		releaseSec = 0.1  
+		attackSec  = 0.01
+		releaseSec = 0.1
 	)
 	attackCoeff := float32(math.Exp(-1.0 / (attackSec * float64(sampleRate))))
 	releaseCoeff := float32(math.Exp(-1.0 / (releaseSec * float64(sampleRate))))

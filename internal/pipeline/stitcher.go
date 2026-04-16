@@ -1,6 +1,7 @@
 package pipeline
 
 import (
+	"sort"
 	"strings"
 
 	"github.com/negbie/sittich/internal/asr"
@@ -14,112 +15,93 @@ type ChunkResult struct {
 	Result    *asr.Result
 }
 
-// StitchResults merges multiple ChunkResults into a single asr.Result.
 func StitchResults(chunks []ChunkResult, padding float64, debug bool) *asr.Result {
 	if len(chunks) == 0 {
 		return &asr.Result{}
 	}
 
-	combined := &asr.Result{}
-	if combined.Language == "" {
-		for _, cr := range chunks {
-			if cr.Result != nil && cr.Result.Language != "" {
-				combined.Language = cr.Result.Language
-				break
-			}
-		}
-	}
-
-	// 1. Sort chunks by offset for sequential stitching
-	// (Already sorted in pipeline.go, but we do 2. merge next)
-
-	// 2. Merge chunks sequentially using temporal ownership
-	allWords := make([]asr.Word, 0)
-	var prevOrigEnd float64
-
+	var language string
 	for _, cr := range chunks {
-		if cr.Result == nil || len(cr.Result.Segments) == 0 {
+		if cr.Result != nil && cr.Result.Language != "" {
+			language = cr.Result.Language
+			break
+		}
+	}
+
+	allWords := make([]asr.Word, 0)
+
+	for i, cr := range chunks {
+		if cr.Result == nil {
 			continue
 		}
 
-		rawTokens := make([]asr.Word, 0)
+		rawWords := make([]asr.Word, 0)
 		for _, seg := range cr.Result.Segments {
-			rawTokens = append(rawTokens, seg.Words...)
+			rawWords = append(rawWords, seg.Words...)
 		}
 
-		if len(allWords) == 0 {
-			for _, w := range rawTokens {
-				w.Start += cr.Offset
-				w.End += cr.Offset
-				if w.Start < cr.OrigEnd {
-					allWords = append(allWords, w)
-				}
+		for _, w := range rawWords {
+			absStart := w.Start + cr.Offset
+			absEnd := w.End + cr.Offset
+			mid := absStart + (absEnd-absStart)/2
+
+			isFirst := i == 0
+			isLast := i == len(chunks)-1
+
+			inWindow := mid >= cr.OrigStart && mid < cr.OrigEnd
+
+			// Defensive guards for absolute file boundaries (first and last chunks).
+			if isFirst && mid < cr.OrigEnd {
+				inWindow = true
 			}
-			prevOrigEnd = cr.OrigEnd
-			continue
-		}
+			if isLast && mid >= cr.OrigStart {
+				inWindow = true
+			}
 
-		chunkGroups := make([]asr.Word, 0, len(rawTokens))
-		for _, g := range rawTokens {
-			g.Start += cr.Offset
-			g.End += cr.Offset
-			chunkGroups = append(chunkGroups, g)
-		}
-
-		splitPoint := (cr.OrigStart + prevOrigEnd) / 2
-
-		trimmedA := make([]asr.Word, 0, len(allWords))
-		for _, w := range allWords {
-			mid := w.Start + (w.End-w.Start)/2
-			if mid < splitPoint {
-				trimmedA = append(trimmedA, w)
+			if inWindow {
+				w.Start = absStart
+				w.End = absEnd
+				allWords = append(allWords, w)
 			}
 		}
-
-		trimmedB := make([]asr.Word, 0, len(rawTokens))
-		for _, g := range chunkGroups {
-			mid := g.Start + (g.End-g.Start)/2
-			if mid >= splitPoint && mid < cr.OrigEnd {
-				trimmedB = append(trimmedB, g)
-			}
-		}
-
-		allWords = append(trimmedA, trimmedB...)
-		prevOrigEnd = cr.OrigEnd
 	}
 
-	// 3. Rebuild text from stitched words with SmartJoin for BPE/SentencePiece tokens.
+	// Safety sort in case chunks or words arrived out of order.
+	sort.Slice(allWords, func(i, j int) bool {
+		return allWords[i].Start < allWords[j].Start
+	})
+
 	var builder strings.Builder
-	for i, w := range allWords {
-		t := w.Word
-		// SentencePiece uses U+2581 (lower one eighth block ' ') as a space prefix.
-		if strings.HasPrefix(t, "\u2581") {
-			if i > 0 {
-				builder.WriteString(" ")
-			}
-			builder.WriteString(strings.TrimPrefix(t, "\u2581"))
-		} else {
-			// If it doesn't have the space marker, it's a subtoken fragment.
-			// Join it directly to the previous word.
-			builder.WriteString(t)
-		}
-	}
-	resText := strings.TrimSpace(builder.String())
-
-	// Clean up markers from individual word tokens for JSON/metadata consumers.
 	for i := range allWords {
-		allWords[i].Word = strings.TrimPrefix(allWords[i].Word, "\u2581")
+		t := allWords[i].Word
+		hasSpace := strings.HasPrefix(t, "\u2581")
+		cleanToken := strings.TrimPrefix(t, "\u2581")
+
+		if hasSpace && i > 0 {
+			builder.WriteString(" ")
+		}
+		builder.WriteString(cleanToken)
+
+		// Update the word in the list for the final result metadata.
+		allWords[i].Word = cleanToken
 	}
 
-	combined.Segments = []asr.Segment{
-		{
-			ID:    0,
-			Text:  resText,
-			Start: 0,
-			End:   0, // Final duration set by Pipeline.Process
-			Words: allWords,
+	var start, end float64
+	if len(allWords) > 0 {
+		start = allWords[0].Start
+		end = allWords[len(allWords)-1].End
+	}
+
+	return &asr.Result{
+		Language: language,
+		Segments: []asr.Segment{
+			{
+				ID:    0,
+				Text:  strings.TrimSpace(builder.String()),
+				Start: start,
+				End:   end,
+				Words: allWords,
+			},
 		},
 	}
-
-	return combined
 }

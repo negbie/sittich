@@ -24,7 +24,7 @@ type Pipeline struct {
 func (p *Pipeline) Process(ctx context.Context, path string, chunkDuration float64, soxFlags ...string) (*asr.Result, error) {
 	const targetRate = 16000
 	start := time.Now()
-	
+
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("pipeline: open: %w", err)
@@ -53,8 +53,11 @@ func (p *Pipeline) Process(ctx context.Context, path string, chunkDuration float
 	}
 
 	overlap := p.Config.ChunkOverlapDuration
-	padding := 0.6
-	if overlap > 0 && overlap/2 > padding {
+	if overlap < 0.4 {
+		overlap = 0.4 // Safety floor for robust stitching
+	}
+	padding := 1.2 // Increased to 1.2s for safer model context (multiple of 40ms)
+	if overlap/2 > padding {
 		padding = overlap / 2
 	}
 
@@ -80,7 +83,7 @@ func (p *Pipeline) Process(ctx context.Context, path string, chunkDuration float
 	}
 
 	if p.Config.Debug {
-		fmt.Fprintf(os.Stderr, "   [Pipeline] Processed %d chunks in %s\n", 
+		fmt.Fprintf(os.Stderr, "   [Pipeline] Processed %d chunks in %s\n",
 			len(asrResults), time.Since(start).Round(time.Millisecond))
 	}
 
@@ -94,13 +97,17 @@ func (p *Pipeline) transcribeChunks(ctx context.Context, samples []float32, targ
 	for i, c := range chunks {
 		start := int(c.Start * float64(targetRate))
 		end := int(c.End * float64(targetRate))
-		if start < 0 { start = 0 }
-		if end > len(samples) { end = len(samples) }
-		if start >= end { continue }
+		if start < 0 {
+			start = 0
+		}
+		if end > len(samples) {
+			end = len(samples)
+		}
+		if start >= end {
+			continue
+		}
 
-		chunk := make([]float32, end-start)
-		copy(chunk, samples[start:end])
-		batch = append(batch, chunk)
+		batch = append(batch, samples[start:end])
 		validIndices = append(validIndices, i)
 	}
 
@@ -108,26 +115,33 @@ func (p *Pipeline) transcribeChunks(ctx context.Context, samples []float32, targ
 		return nil, nil
 	}
 
-	opts := asr.Options{
+	results, err := p.Engine.TranscribeBatch(ctx, batch, targetRate, asr.Options{
 		Language:       p.Config.Language,
 		WordTimestamps: p.Config.WordTimestamps,
 		Debug:          p.Config.Debug,
-	}
-
-	results, err := p.Engine.TranscribeBatch(ctx, batch, targetRate, opts)
+	})
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("pipeline: batch transcribe: %w", err)
 	}
 
-	chunkResults := make([]ChunkResult, len(results))
+	// Falls die Engine leer zurückgibt, obwohl Chunks da waren
+	if len(results) == 0 && len(batch) > 0 {
+		return nil, nil
+	}
+
+	chunkResults := make([]ChunkResult, 0, len(results))
 	for i, res := range results {
-		ci := validIndices[i]
-		chunkResults[i] = ChunkResult{
-			Offset:    chunks[ci].Start,
-			OrigStart: chunks[ci].OrigStart,
-			OrigEnd:   chunks[ci].OrigEnd,
+		if res == nil {
+			continue
+		} // Falls ein Chunk fehlschlug
+
+		idx := validIndices[i]
+		chunkResults = append(chunkResults, ChunkResult{
+			Offset:    chunks[idx].Start,
+			OrigStart: chunks[idx].OrigStart,
+			OrigEnd:   chunks[idx].OrigEnd,
 			Result:    res,
-		}
+		})
 	}
 	return chunkResults, nil
 }
@@ -136,8 +150,10 @@ func (p *Pipeline) verifySignal(samples []float32, targetRate int) {
 	var peak float32
 	for _, s := range samples {
 		abs := float32(math.Abs(float64(s)))
-		if abs > peak { peak = abs }
+		if abs > peak {
+			peak = abs
+		}
 	}
-	fmt.Fprintf(os.Stderr, "   [Pipeline] signal samples=%d duration=%.2fs peak=%.4f\n", 
+	fmt.Fprintf(os.Stderr, "   [Pipeline] signal samples=%d duration=%.2fs peak=%.4f\n",
 		len(samples), float64(len(samples))/float64(targetRate), peak)
 }

@@ -32,8 +32,6 @@ type HealthResponse struct {
 	ModelLoaded bool   `json:"model_loaded"`
 	Version     string `json:"version"`
 	Uptime      string `json:"uptime"`
-	Workers     int    `json:"workers"`
-	BusyWorkers int    `json:"busy_workers"`
 	Proxy       string `json:"proxy,omitempty"`
 }
 

@@ -194,8 +194,6 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		ModelLoaded: true,
 		Version:     s.version,
 		Uptime:      uptime.Round(time.Second).String(),
-		Workers:     cap(s.sem),
-		BusyWorkers: len(s.sem),
 		Proxy:       s.options.Proxy,
 	})
 }

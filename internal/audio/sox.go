@@ -25,8 +25,8 @@ func decodeWithSox(ctx context.Context, r io.Reader, extraFlags ...string) ([]fl
 	if len(extraFlags) > 0 {
 		args = append(args, extraFlags...)
 	} else {
-		args = append(args, "silence", "1", "0.05", "0.1%")
-		args = append(args, "gain", "-h")
+		//args = append(args, "silence", "1", "0.05", "0.5%")
+		args = append(args, "vad")
 	}
 
 	cmd := exec.CommandContext(ctx, "sox", args...)
