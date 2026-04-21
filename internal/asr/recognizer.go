@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync"
 
@@ -19,44 +20,63 @@ type Recognizer struct {
 	mu         sync.Mutex
 	cond       *sync.Cond
 	active     int
+	inFlight   int
 	closed     bool
 	maxActive  int // limits concurrent DecodeStreams to cap ONNX arena memory
 }
 
 func NewRecognizer(cfg *config.ASR) (*Recognizer, error) {
+	r := &Recognizer{
+		Config:    cfg,
+		maxActive: cfg.MaxActive,
+	}
+	r.cond = sync.NewCond(&r.mu)
+
+	if !cfg.Lazy {
+		if err := r.ensureLoaded(); err != nil {
+			return nil, err
+		}
+	}
+
+	return r, nil
+}
+
+func (r *Recognizer) ensureLoaded() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.inFlight++
+
+	if r.recognizer != nil {
+		return nil
+	}
+
 	sherpaConfig := sherpa.OfflineRecognizerConfig{
 		FeatConfig: sherpa.FeatureConfig{
 			SampleRate: 16000,
-			FeatureDim: 128,
+			FeatureDim: 80,
 		},
 		ModelConfig: sherpa.OfflineModelConfig{
 			Transducer: sherpa.OfflineTransducerModelConfig{
-				Encoder: filepath.Join(cfg.ModelPath, models.EncoderFile),
-				Decoder: filepath.Join(cfg.ModelPath, models.DecoderFile),
-				Joiner:  filepath.Join(cfg.ModelPath, models.JoinerFile),
+				Encoder: filepath.Join(r.Config.ModelPath, models.EncoderFile),
+				Decoder: filepath.Join(r.Config.ModelPath, models.DecoderFile),
+				Joiner:  filepath.Join(r.Config.ModelPath, models.JoinerFile),
 			},
-			Tokens:     filepath.Join(cfg.ModelPath, models.TokensFile),
+			Tokens:     filepath.Join(r.Config.ModelPath, models.TokensFile),
 			Provider:   "cpu",
 			ModelType:  "nemo_transducer",
-			NumThreads: cfg.NumThreads,
+			NumThreads: r.Config.NumThreads,
 		},
-		DecodingMethod: cfg.DecodingMethod,
-		MaxActivePaths: cfg.MaxActivePaths,
+		DecodingMethod: r.Config.DecodingMethod,
+		MaxActivePaths: r.Config.MaxActivePaths,
 	}
 
 	recognizer := sherpa.NewOfflineRecognizer(&sherpaConfig)
 	if recognizer == nil {
-		return nil, fmt.Errorf("asr: failed to initialize sherpa-onnx")
+		return fmt.Errorf("asr: failed to initialize sherpa-onnx")
 	}
-
-	r := &Recognizer{
-		Config:     cfg,
-		recognizer: recognizer,
-		maxActive:  cfg.MaxActive,
-	}
-	r.cond = sync.NewCond(&r.mu)
-
-	return r, nil
+	r.recognizer = recognizer
+	return nil
 }
 
 // Transcribe handles a single audio chunk.
@@ -71,90 +91,132 @@ func (r *Recognizer) Transcribe(ctx context.Context, audio []float32, sampleRate
 	return results[0], nil
 }
 
-// TranscribeBatch handles multiple chunks. It uses a semaphore to limit concurrent 
+// TranscribeBatch handles multiple chunks. It uses a semaphore to limit concurrent
 // ONNX decodes, preventing unbounded memory growth in the runtime arena.
 func (r *Recognizer) TranscribeBatch(ctx context.Context, chunks [][]float32, sampleRate int, opts Options) ([]*Result, error) {
-	if r == nil || r.recognizer == nil {
-		return nil, fmt.Errorf("asr: recognizer is nil or closed")
+	if r == nil {
+		return nil, fmt.Errorf("asr: recognizer is nil")
 	}
 
-	streams := make([]*sherpa.OfflineStream, len(chunks))
-	for i, chunk := range chunks {
-		s := sherpa.NewOfflineStream(r.recognizer)
-		if s == nil {
-			for _, st := range streams[:i] {
-				sherpa.DeleteOfflineStream(st)
-			}
-			return nil, fmt.Errorf("asr: failed to create stream")
+	if err := r.ensureLoaded(); err != nil {
+		return nil, err
+	}
+	defer r.release()
+
+	limit := r.maxActive
+	if limit < 1 {
+		limit = 1
+	}
+
+	results := make([]*Result, len(chunks))
+
+	for i := 0; i < len(chunks); i += limit {
+		end := i + limit
+		if end > len(chunks) {
+			end = len(chunks)
 		}
-		s.AcceptWaveform(sampleRate, chunk)
-		streams[i] = s
-	}
+		currentBatch := chunks[i:end]
+		batchLen := len(currentBatch)
 
-	r.mu.Lock()
-	for r.active >= r.maxActive {
-		r.cond.Wait()
-	}
-	if r.closed {
-		r.mu.Unlock()
-		for _, s := range streams {
-			sherpa.DeleteOfflineStream(s)
-		}
-		return nil, fmt.Errorf("asr: recognizer closed")
-	}
-	r.active++
-	r.mu.Unlock()
-
-	r.recognizer.DecodeStreams(streams)
-
-	defer func() {
-		for _, s := range streams {
-			sherpa.DeleteOfflineStream(s)
-		}
 		r.mu.Lock()
-		r.active--
-		r.cond.Signal()
-		r.mu.Unlock()
-	}()
-
-	results := make([]*Result, len(streams))
-	for i, s := range streams {
-		res := s.GetResult()
-		duration := float64(len(chunks[i])) / float64(sampleRate)
-		
-		out := &Result{Duration: duration}
-		if res != nil {
-			cleanText := strings.ReplaceAll(res.Text, "\u2581", " ")
-			seg := Segment{
-				End:  duration,
-				Text: strings.TrimSpace(cleanText),
-			}
-			if len(res.Timestamps) > 0 {
-				n := min(len(res.Tokens), len(res.Timestamps))
-				seg.Words = make([]Word, n)
-				for j := range n {
-					start := float64(res.Timestamps[j])
-					end := start + 0.1
-					if j+1 < n {
-						if next := float64(res.Timestamps[j+1]); next > start {
-							end = next
-						}
-					}
-					seg.Words[j] = Word{Word: res.Tokens[j], Start: start, End: end}
-				}
-			}
-			out.Segments = []Segment{seg}
+		for r.active+batchLen > limit {
+			r.cond.Wait()
 		}
-		results[i] = out
+		if r.closed {
+			r.mu.Unlock()
+			return nil, fmt.Errorf("asr: recognizer closed")
+		}
+		r.active += batchLen
+		r.mu.Unlock()
+
+		streams := make([]*sherpa.OfflineStream, batchLen)
+		for j, chunk := range currentBatch {
+			s := sherpa.NewOfflineStream(r.recognizer)
+			if s == nil {
+				for _, st := range streams[:j] {
+					sherpa.DeleteOfflineStream(st)
+				}
+				r.mu.Lock()
+				r.active -= batchLen
+				r.cond.Broadcast()
+				r.mu.Unlock()
+				return nil, fmt.Errorf("asr: failed to create stream")
+			}
+			s.AcceptWaveform(sampleRate, chunk)
+			streams[j] = s
+		}
+
+		r.recognizer.DecodeStreams(streams)
+
+		for j, s := range streams {
+			res := s.GetResult()
+			duration := float64(len(currentBatch[j])) / float64(sampleRate)
+
+			out := &Result{Duration: duration}
+			if res != nil {
+				cleanText := strings.ReplaceAll(res.Text, "\u2581", " ")
+				seg := Segment{
+					End:  duration,
+					Text: strings.TrimSpace(cleanText),
+				}
+				if len(res.Timestamps) > 0 {
+					n := len(res.Timestamps)
+					if len(res.Tokens) < n {
+						n = len(res.Tokens)
+					}
+					seg.Words = make([]Word, n)
+					for k := 0; k < n; k++ {
+						start := float64(res.Timestamps[k])
+						wend := start + 0.1
+						if k+1 < n {
+							if next := float64(res.Timestamps[k+1]); next > start {
+								wend = next
+							}
+						}
+						seg.Words[k] = Word{Word: res.Tokens[k], Start: start, End: wend}
+					}
+				}
+				out.Segments = []Segment{seg}
+			}
+			results[i+j] = out
+			sherpa.DeleteOfflineStream(s)
+		}
+
+		r.mu.Lock()
+		r.active -= batchLen
+		r.cond.Broadcast()
+		r.mu.Unlock()
 	}
+
 	return results, nil
+}
+
+func (r *Recognizer) release() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.inFlight--
+
+	if !r.Config.Lazy {
+		return
+	}
+
+	if r.inFlight == 0 && r.recognizer != nil {
+		sherpa.DeleteOfflineRecognizer(r.recognizer)
+		r.recognizer = nil
+		// Return both Go and C++ heap memory to the OS immediately.
+		debug.FreeOSMemory()
+		trimCHeap()
+	}
 }
 
 func (r *Recognizer) SupportedLanguages() []string { return nil }
 func (r *Recognizer) ModelName() string            { return filepath.Base(r.Config.ModelPath) }
 
 func (r *Recognizer) Close() error {
-	if r == nil { return nil }
+	if r == nil {
+		return nil
+	}
 	r.mu.Lock()
 	if r.closed {
 		r.mu.Unlock()

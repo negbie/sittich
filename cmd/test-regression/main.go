@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -26,7 +27,7 @@ type TestResult struct {
 }
 
 func main() {
-	serverURL := flag.String("url", "http://localhost:5092/transcribe", "Sittich server URL")
+	serverURL := flag.String("url", "https://localhost:5092/transcribe", "Sittich server URL")
 	audioDir := flag.String("audio", "./bin/audio", "Directory containing WAV files")
 	truthFile := flag.String("truth", "./bin/truth.json", "JSON file mapping filename to ground truth text")
 	flag.Parse()
@@ -106,7 +107,12 @@ func callServer(url, filename string, audio []byte) (string, time.Duration, erro
 	req, _ := http.NewRequest("POST", url, body)
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 
-	client := &http.Client{Timeout: 60 * time.Second}
+	client := &http.Client{
+		Timeout: 60 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", 0, err

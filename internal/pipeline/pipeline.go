@@ -16,8 +16,9 @@ import (
 
 // Pipeline orchestrates audio processing and transcription.
 type Pipeline struct {
-	Engine asr.Engine
-	Config config.Pipeline
+	Engine   asr.Engine
+	Denoiser *asr.Denoiser
+	Config   config.Pipeline
 }
 
 // Process runs the transcription pipeline.
@@ -36,16 +37,30 @@ func (p *Pipeline) Process(ctx context.Context, path string, chunkDuration float
 		return nil, fmt.Errorf("pipeline: decode: %w", err)
 	}
 
+	if p.Config.Debug {
+		audio.DebugPlotWaveform(samples, "Input")
+	}
+
+	if p.Config.Denoise && p.Denoiser != nil {
+		if p.Config.Debug {
+			fmt.Fprintf(os.Stderr, "   [Pipeline] Denoising signal (GTCRN)...\n")
+		}
+		denoised, err := p.Denoiser.Run(samples, targetRate)
+		if err != nil {
+			return nil, fmt.Errorf("pipeline: denoise: %w", err)
+		}
+		samples = denoised
+		if p.Config.Debug {
+			audio.DebugPlotWaveform(samples, "Denoised (GTCRN)")
+		}
+	}
+
 	totalDur := float64(len(samples)) / float64(targetRate)
 	if chunkDuration <= 0 {
 		chunkDuration = p.Config.ChunkDuration
 	}
 
-	if p.Config.Debug {
-		audio.DebugPlotWaveform(samples, "Input")
-	}
-
-	audio.ConditionAudioSignal(samples, targetRate)
+	samples = audio.ConditionAudioSignal(samples, targetRate)
 
 	if p.Config.Debug {
 		audio.DebugPlotWaveform(samples, "Processed")
@@ -124,7 +139,6 @@ func (p *Pipeline) transcribeChunks(ctx context.Context, samples []float32, targ
 		return nil, fmt.Errorf("pipeline: batch transcribe: %w", err)
 	}
 
-	// Falls die Engine leer zurückgibt, obwohl Chunks da waren
 	if len(results) == 0 && len(batch) > 0 {
 		return nil, nil
 	}
@@ -133,7 +147,7 @@ func (p *Pipeline) transcribeChunks(ctx context.Context, samples []float32, targ
 	for i, res := range results {
 		if res == nil {
 			continue
-		} // Falls ein Chunk fehlschlug
+		}
 
 		idx := validIndices[i]
 		chunkResults = append(chunkResults, ChunkResult{

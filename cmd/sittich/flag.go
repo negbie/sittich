@@ -27,25 +27,39 @@ type cliOptions struct {
 	NumThreads           int
 	MaxUploadMB          int
 	Debug                bool
+	Denoise              bool
+	Lazy                 bool
 	ShowVersion          bool
 	DataFolder           string
 	Proxy                string
+	S3DataDir            string
+	S3Enabled            bool
+	CertPath             string
+	KeyPath              string
+	DisableHTTPS         bool
 }
 
 func defineFlags(fs *flag.FlagSet, opts *cliOptions) {
 	fs.StringVar(&opts.ListenAddr, "listen", ":5092", "listen address")
-	fs.IntVar(&opts.NumThreads, "num-threads", 2, "ONNX thread pool size per stream")
-	fs.IntVar(&opts.MaxActiveStreams, "max-active-streams", 4, "max concurrent streams (0 = auto)")
+	fs.IntVar(&opts.NumThreads, "num-threads", 4, "ONNX thread pool size per stream")
+	fs.IntVar(&opts.MaxActiveStreams, "max-active-streams", 1, "max concurrent streams (0 = auto)")
 	fs.IntVar(&opts.MaxUploadMB, "max-upload", 16, "max upload size in MB")
 	fs.StringVar(&opts.Format, "format", "text", "output format: text, json, vtt")
 	fs.IntVar(&opts.ChunkSize, "chunk-size", 40, "chunk size in seconds")
 	fs.Float64Var(&opts.ChunkOverlapDuration, "chunk-overlap", 0.4, "overlap in seconds")
-	fs.IntVar(&opts.MaxActivePaths, "max-active-paths", 5, "active paths for beam search")
+	fs.IntVar(&opts.MaxActivePaths, "max-active-paths", 4, "active paths for beam search")
 	fs.StringVar(&opts.DecodingMethod, "decoding-method", "greedy_search", "greedy_search or modified_beam_search")
 	fs.StringVar(&opts.DataFolder, "data-folder", "", "path to model directory")
 	fs.StringVar(&opts.Proxy, "proxy", "", "proxy URL for remote transcription")
+	fs.StringVar(&opts.S3DataDir, "s3-data", "./data/s3", "directory for S3 storage")
+	fs.BoolVar(&opts.S3Enabled, "s3-enabled", false, "enable S3 server")
 	fs.BoolVar(&opts.Debug, "debug", false, "detailed debug logs")
+	fs.BoolVar(&opts.Denoise, "denoise", false, "enable speech enhancement (GTCRN)")
+	fs.BoolVar(&opts.Lazy, "lazy", false, "lazy mode (load model on demand and unload immediately)")
 	fs.BoolVar(&opts.ShowVersion, "version", false, "show version")
+	fs.StringVar(&opts.CertPath, "cert", "", "path to HTTPS certificate")
+	fs.StringVar(&opts.KeyPath, "key", "", "path to HTTPS private key")
+	fs.BoolVar(&opts.DisableHTTPS, "disable-https", false, "disable HTTPS and use plain HTTP")
 }
 
 func parseCLI(args []string) (cliOptions, error) {
@@ -83,5 +97,7 @@ func recognizerConfigFromCLI(opts cliOptions, modelPath string) *config.ASR {
 		MaxActive:      opts.MaxActiveStreams,
 		DecodingMethod: opts.DecodingMethod,
 		MaxActivePaths: opts.MaxActivePaths,
+		Denoise:        opts.Denoise,
+		Lazy:           opts.Lazy,
 	}
 }

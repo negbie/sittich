@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -22,6 +23,7 @@ var httpClient = &http.Client{
 		MaxIdleConns:        16,
 		MaxIdleConnsPerHost: 16,
 		IdleConnTimeout:     90 * time.Second,
+		TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
 	},
 }
 
@@ -51,7 +53,7 @@ type Summary struct {
 }
 
 func main() {
-	serverURL := flag.String("url", "http://localhost:5092/transcribe", "Sittich server URL")
+	serverURL := flag.String("url", "https://localhost:5092/transcribe", "Sittich server URL")
 	audioDir := flag.String("audio", "./audio", "Directory containing WAV files")
 	truthFile := flag.String("truth", "./truth.json", "JSON file mapping filename to ground truth text")
 	parallel := flag.Int("parallel", 4, "Number of parallel benchmark workers")

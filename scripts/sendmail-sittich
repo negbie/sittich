@@ -11,9 +11,9 @@
 
 set -eu
 
-API_URL="${API_URL:-http://localhost:5092/transcribe}"
+API_URL="${API_URL:-https://localhost:5092/transcribe}"
 API_OPTS="${API_OPTS:-}"
-CURL_OPTS="${CURL_OPTS:-}"
+CURL_OPTS="${CURL_OPTS:--k}"
 
 ORIG_PWD=$(pwd)
 TMPDIR=$(mktemp -d)

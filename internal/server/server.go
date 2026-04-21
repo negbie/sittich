@@ -20,39 +20,49 @@ import (
 	"github.com/negbie/sittich/internal/models"
 	"github.com/negbie/sittich/internal/output"
 	"github.com/negbie/sittich/internal/pipeline"
+	"mime/multipart"
 )
 
 // Server provides the HTTP interface for transcription.
 type Server struct {
 	httpServer *http.Server
+	mux        *http.ServeMux
 	engine     asr.Engine
 	options    *config.Server
 	pipeline   config.Pipeline
+	denoiser   *asr.Denoiser
 	sem        chan struct{}
 	version    string
 	startTime  time.Time
 }
 
-func NewServer(options *config.Server, pipeline config.Pipeline, engine asr.Engine, version string) *Server {
+func NewServer(options *config.Server, pipeline config.Pipeline, engine asr.Engine, denoiser *asr.Denoiser, version string) *Server {
 	s := &Server{
 		engine:    engine,
 		options:   options,
 		pipeline:  pipeline,
+		denoiser:  denoiser,
 		sem:       make(chan struct{}, options.Workers),
 		version:   version,
 		startTime: time.Now(),
+		mux:       http.NewServeMux(),
 	}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/transcribe", s.handleTranscribe)
-	mux.HandleFunc("/health", s.handleHealth)
+	s.mux.HandleFunc("/transcribe", s.handleTranscribe)
+	s.mux.HandleFunc("/health", s.handleHealth)
 
 	s.httpServer = &http.Server{
 		Addr:    options.ListenAddr,
-		Handler: s.withMiddleware(mux),
+		Handler: s.withMiddleware(s.mux),
 	}
 
 	return s
+}
+
+func (s *Server) SetS3Handler(h http.Handler) {
+	if h != nil {
+		s.mux.Handle("/", h)
+	}
 }
 
 func (s *Server) SetDefaults(format string, chunkSize int) {
@@ -64,7 +74,31 @@ func (s *Server) SetDefaults(format string, chunkSize int) {
 	}
 }
 
-func (s *Server) Start() error { return s.httpServer.ListenAndServe() }
+func (s *Server) Start() error {
+	if s.options.DisableHTTPS {
+		return s.httpServer.ListenAndServe()
+	}
+
+	// Ensure we have certificate paths
+	if s.options.CertFile == "" || s.options.KeyFile == "" {
+		return fmt.Errorf("certificate and key paths are required for HTTPS")
+	}
+
+	// Check if certs exist, generate if not
+	if _, err := os.Stat(s.options.CertFile); os.IsNotExist(err) {
+		fmt.Fprintf(os.Stderr, "Generating self-signed certificate: %s\n", s.options.CertFile)
+		if err := GenerateSelfSignedCert(s.options.CertFile, s.options.KeyFile); err != nil {
+			return fmt.Errorf("failed to generate certificates: %w", err)
+		}
+	} else if _, err := os.Stat(s.options.KeyFile); os.IsNotExist(err) {
+		fmt.Fprintf(os.Stderr, "Generating missing key for certificate: %s\n", s.options.KeyFile)
+		if err := GenerateSelfSignedCert(s.options.CertFile, s.options.KeyFile); err != nil {
+			return fmt.Errorf("failed to generate certificates: %w", err)
+		}
+	}
+
+	return s.httpServer.ListenAndServeTLS(s.options.CertFile, s.options.KeyFile)
+}
 
 func (s *Server) Shutdown(ctx context.Context) error { return s.httpServer.Shutdown(ctx) }
 
@@ -117,48 +151,64 @@ func (s *Server) processLocalTranscribe(w http.ResponseWriter, r *http.Request) 
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
 	defer cancel()
 
-	// Acquire a worker slot.
-	select {
-	case s.sem <- struct{}{}:
-		defer func() { <-s.sem }()
-	case <-ctx.Done():
-		s.sendError(w, http.StatusServiceUnavailable, "server too busy")
-		return
-	}
-
-	jobID := strconv.FormatInt(time.Now().UnixNano(), 10)
-	if s.options != nil && s.options.Debug {
-		fmt.Fprintf(os.Stderr, "[HTTP] job_start=%s job_id=%s\n", time.Since(requestStart).Round(time.Millisecond), jobID)
-	}
-
-	pipe := &pipeline.Pipeline{
-		Engine: s.engine,
-		Config: s.pipeline,
-	}
-
-	startTime := time.Now()
-	result, err := pipe.Process(ctx, filePath, float64(chunkSize), soxFlags...)
+	result, err := s.ProcessTranscribe(ctx, filePath, format, chunkSize, soxFlags)
 	if err != nil {
-		if s.options != nil && s.options.Debug {
-			fmt.Fprintf(os.Stderr, "[HTTP] job_failed=%s job_id=%s err=%v\n", time.Since(requestStart).Round(time.Millisecond), jobID, err)
-		}
 		s.sendError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
-	processingTime := time.Since(startTime).Seconds()
+	processingTime := time.Since(requestStart).Seconds()
 	rtFactor := result.Duration / processingTime
 	if rtFactor < 0 {
 		rtFactor = 0
 	}
 
 	if s.options != nil && s.options.Debug {
-		processingElapsed := time.Since(startTime).Round(time.Millisecond)
-		totalElapsed := time.Since(requestStart).Round(time.Millisecond)
-		fmt.Fprintf(os.Stderr, "[HTTP] job_done=%s job_id=%s processing_time=%s total_time=%s rtf=%.2f\n", jobID, time.Since(startTime).Round(time.Millisecond), processingElapsed, totalElapsed, rtFactor)
+		fmt.Fprintf(os.Stderr, "[HTTP] job_done=%s processing_time=%.2fs rtf=%.2f\n", r.URL.Path, processingTime, rtFactor)
 	}
 
 	s.sendFormattedResponse(w, format, result, processingTime, rtFactor)
+}
+
+// ProcessTranscribe handles the transcription of a file, respecting proxy settings if configured.
+func (s *Server) ProcessTranscribe(ctx context.Context, filePath string, format string, chunkSize int, soxFlags []string) (*asr.Result, error) {
+	if s.options != nil && s.options.Proxy != "" {
+		return s.transcribeWithProxy(ctx, filePath, format, chunkSize, soxFlags)
+	}
+
+	return s.transcribeLocal(ctx, filePath, chunkSize, soxFlags)
+}
+
+func (s *Server) transcribeLocal(ctx context.Context, filePath string, chunkSize int, soxFlags []string) (*asr.Result, error) {
+	// Acquire a worker slot.
+	select {
+	case s.sem <- struct{}{}:
+		defer func() { <-s.sem }()
+	case <-ctx.Done():
+		return nil, fmt.Errorf("server too busy")
+	}
+
+	pipe := &pipeline.Pipeline{
+		Engine:   s.engine,
+		Denoiser: s.denoiser,
+		Config:   s.pipeline,
+	}
+
+	return pipe.Process(ctx, filePath, float64(chunkSize), soxFlags...)
+}
+
+func (s *Server) transcribeWithProxy(ctx context.Context, filePath string, format string, chunkSize int, soxFlags []string) (*asr.Result, error) {
+	proxyURL := s.options.Proxy
+	if !strings.HasPrefix(proxyURL, "http") {
+		proxyURL = "http://" + proxyURL
+	}
+	u, err := url.Parse(proxyURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid proxy URL: %w", err)
+	}
+	u.Path = "/transcribe"
+
+	return s.doProxyPOST(ctx, u.String(), filePath, format, chunkSize, soxFlags)
 }
 
 func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, targetURL string) {
@@ -337,6 +387,76 @@ func (s *Server) sendFormattedResponse(w http.ResponseWriter, format string, res
 	}
 }
 
+func (s *Server) doProxyPOST(ctx context.Context, targetURL, filePath, format string, chunkSize int, soxFlags []string) (*asr.Result, error) {
+	f, err := os.Open(filePath)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	body, pw := io.Pipe()
+
+	writer := multipart.NewWriter(pw)
+
+	errChan := make(chan error, 1)
+	go func() {
+		defer pw.Close()
+		defer writer.Close()
+
+		part, err := writer.CreateFormFile("file", filepath.Base(filePath))
+		if err != nil {
+			errChan <- err
+			return
+		}
+		if _, err := io.Copy(part, f); err != nil {
+			errChan <- err
+			return
+		}
+
+		if format != "" {
+			writer.WriteField("format", format)
+		}
+		if chunkSize > 0 {
+			writer.WriteField("chunk_size", strconv.Itoa(chunkSize))
+		}
+		for _, sf := range soxFlags {
+			writer.WriteField("sox_flags", sf)
+		}
+	}()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, body)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("X-Sittich-Proxy-Loop", "true")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("proxy failed with status %s: %s", resp.Status, string(b))
+	}
+
+	var res TranscribeResponse
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		return nil, fmt.Errorf("failed to decode proxy response: %w", err)
+	}
+
+	if !res.Success {
+		return nil, fmt.Errorf("proxy error: %s", res.Error)
+	}
+
+	return &asr.Result{
+		Duration: res.Duration,
+		Segments: res.Segments,
+	}, nil
+}
+
 func LoadRecognizer(cfg *config.ASR) (*asr.Recognizer, error) {
 	modelPath, err := models.GetModelPath(cfg.ModelPath)
 	if err != nil { return nil, fmt.Errorf("failed to get model: %w", err) }
@@ -348,4 +468,17 @@ func LoadRecognizer(cfg *config.ASR) (*asr.Recognizer, error) {
 	}
 
 	return asr.NewRecognizer(cfg)
+}
+
+func LoadDenoiser(cfg *config.ASR) (*asr.Denoiser, error) {
+	if !cfg.Denoise {
+		return nil, nil
+	}
+
+	denoiserPath, err := models.GetDenoiserPath(cfg.ModelPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get denoiser model: %w", err)
+	}
+
+	return asr.NewDenoiser(denoiserPath, cfg.NumThreads, cfg.Lazy)
 }

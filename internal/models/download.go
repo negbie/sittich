@@ -19,6 +19,9 @@ const (
 	DecoderFile = "decoder.int8.onnx"
 	JoinerFile  = "joiner.int8.onnx"
 	TokensFile  = "tokens.txt"
+
+	DenoiserFile = "gtcrn_simple.onnx"
+	DenoiserURL  = "https://github.com/k2-fsa/sherpa-onnx/releases/download/speech-enhancement-models/gtcrn_simple.onnx"
 )
 
 var requiredModelFiles = []string{EncoderFile, DecoderFile, JoinerFile, TokensFile}
@@ -77,6 +80,26 @@ func GetModelPath(dataDir string) (string, error) {
 	}
 
 	return dataDir, nil
+}
+
+// GetDenoiserPath returns the path to the denoiser model, downloading if necessary.
+func GetDenoiserPath(dataDir string) (string, error) {
+	if dataDir == "" {
+		dataDir = "./data"
+	}
+
+	path := filepath.Join(dataDir, DenoiserFile)
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		fmt.Fprintf(os.Stderr, "Downloading denoiser model to %s...\n", path)
+		if err := os.MkdirAll(dataDir, 0755); err != nil {
+			return "", err
+		}
+		if err := downloadFile(DenoiserURL, path); err != nil {
+			return "", fmt.Errorf("failed to download denoiser: %w", err)
+		}
+	}
+
+	return path, nil
 }
 
 

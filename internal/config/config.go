@@ -9,6 +9,9 @@ type Server struct {
 	DefaultFormat    string
 	DefaultChunkSize int
 	Proxy            string
+	CertFile         string
+	KeyFile          string
+	DisableHTTPS     bool
 }
 
 // ASR holds ASR configuration.
@@ -18,6 +21,8 @@ type ASR struct {
 	MaxActive      int
 	DecodingMethod string
 	MaxActivePaths int
+	Denoise        bool
+	Lazy           bool
 }
 
 // Pipeline holds pipeline behaviour.
@@ -35,6 +40,9 @@ type Pipeline struct {
 
 	// Language is a BCP-47 hint passed to the engine (empty = auto-detect).
 	Language string
+
+	// Denoise enables speech enhancement before transcription.
+	Denoise bool
 
 	// Debug enables detailed console logging.
 	Debug bool
