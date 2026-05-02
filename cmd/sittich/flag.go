@@ -5,8 +5,8 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"runtime"
 	"strings"
+	"time"
 
 	"github.com/negbie/sittich/internal/config"
 )
@@ -22,12 +22,11 @@ type cliOptions struct {
 	ChunkOverlapDuration float64
 	Format               string
 	MaxActivePaths       int
-	MaxActiveStreams     int
+	MaxConcurrency       int
 	DecodingMethod       string
 	NumThreads           int
 	MaxUploadMB          int
 	Debug                bool
-	Denoise              bool
 	Lazy                 bool
 	ShowVersion          bool
 	DataFolder           string
@@ -37,29 +36,34 @@ type cliOptions struct {
 	CertPath             string
 	KeyPath              string
 	DisableHTTPS         bool
+	IdleTimeout          time.Duration
+	VAD                  bool
+	DualModel            bool
 }
 
 func defineFlags(fs *flag.FlagSet, opts *cliOptions) {
 	fs.StringVar(&opts.ListenAddr, "listen", ":5092", "listen address")
 	fs.IntVar(&opts.NumThreads, "num-threads", 4, "ONNX thread pool size per stream")
-	fs.IntVar(&opts.MaxActiveStreams, "max-active-streams", 1, "max concurrent streams (0 = auto)")
 	fs.IntVar(&opts.MaxUploadMB, "max-upload", 16, "max upload size in MB")
 	fs.StringVar(&opts.Format, "format", "text", "output format: text, json, vtt")
 	fs.IntVar(&opts.ChunkSize, "chunk-size", 40, "chunk size in seconds")
 	fs.Float64Var(&opts.ChunkOverlapDuration, "chunk-overlap", 0.4, "overlap in seconds")
 	fs.IntVar(&opts.MaxActivePaths, "max-active-paths", 4, "active paths for beam search")
+	fs.IntVar(&opts.MaxConcurrency, "concurrency", 1, "max concurrent ONNX streams per engine")
 	fs.StringVar(&opts.DecodingMethod, "decoding-method", "greedy_search", "greedy_search or modified_beam_search")
 	fs.StringVar(&opts.DataFolder, "data-folder", "", "path to model directory")
 	fs.StringVar(&opts.Proxy, "proxy", "", "proxy URL for remote transcription")
 	fs.StringVar(&opts.S3DataDir, "s3-data", "./data/s3", "directory for S3 storage")
 	fs.BoolVar(&opts.S3Enabled, "s3-enabled", false, "enable S3 server")
 	fs.BoolVar(&opts.Debug, "debug", false, "detailed debug logs")
-	fs.BoolVar(&opts.Denoise, "denoise", false, "enable speech enhancement (GTCRN)")
 	fs.BoolVar(&opts.Lazy, "lazy", false, "lazy mode (load model on demand and unload immediately)")
 	fs.BoolVar(&opts.ShowVersion, "version", false, "show version")
 	fs.StringVar(&opts.CertPath, "cert", "", "path to HTTPS certificate")
 	fs.StringVar(&opts.KeyPath, "key", "", "path to HTTPS private key")
 	fs.BoolVar(&opts.DisableHTTPS, "disable-https", false, "disable HTTPS and use plain HTTP")
+	fs.DurationVar(&opts.IdleTimeout, "idle-timeout", 6*time.Hour, "idle time before unloading models (e.g. 5m, 0 to disable)")
+	fs.BoolVar(&opts.VAD, "vad", false, "enable Voice Activity Detection")
+	fs.BoolVar(&opts.DualModel, "dual-model", false, "use a second model engine for voting (more accurate but slower/more RAM)")
 }
 
 func parseCLI(args []string) (cliOptions, error) {
@@ -74,12 +78,6 @@ func parseCLI(args []string) (cliOptions, error) {
 	opts.Format = strings.ToLower(opts.Format)
 	opts.DecodingMethod = strings.ToLower(opts.DecodingMethod)
 
-	if opts.MaxActiveStreams == 0 {
-		opts.MaxActiveStreams = runtime.NumCPU() / opts.NumThreads
-		if opts.MaxActiveStreams < 1 {
-			opts.MaxActiveStreams = 1
-		}
-	}
 	return opts, nil
 }
 
@@ -94,10 +92,12 @@ func recognizerConfigFromCLI(opts cliOptions, modelPath string) *config.ASR {
 	return &config.ASR{
 		ModelPath:      modelPath,
 		NumThreads:     opts.NumThreads,
-		MaxActive:      opts.MaxActiveStreams,
 		DecodingMethod: opts.DecodingMethod,
 		MaxActivePaths: opts.MaxActivePaths,
-		Denoise:        opts.Denoise,
+		MaxConcurrency: opts.MaxConcurrency,
 		Lazy:           opts.Lazy,
+		IdleTimeout:    opts.IdleTimeout,
+		VADEnabled:     opts.VAD,
+		DualModel:      opts.DualModel,
 	}
 }

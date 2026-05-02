@@ -8,15 +8,12 @@ import (
 	"encoding/pem"
 	"fmt"
 	"math/big"
-	"net"
 	"os"
 	"path/filepath"
 	"time"
 )
 
-// GenerateSelfSignedCert creates a self-signed certificate and key and saves them to the specified paths.
 func GenerateSelfSignedCert(certPath, keyPath string) error {
-	// Create directory if it doesn't exist
 	if err := os.MkdirAll(filepath.Dir(certPath), 0755); err != nil {
 		return fmt.Errorf("failed to create certificate directory: %w", err)
 	}
@@ -49,9 +46,7 @@ func GenerateSelfSignedCert(certPath, keyPath string) error {
 		BasicConstraintsValid: true,
 	}
 
-	// Add DNS names and IP addresses requested by user
-	template.DNSNames = []string{"localhost", "sp"}
-	template.IPAddresses = []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")}
+
 
 	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
 	if err != nil {

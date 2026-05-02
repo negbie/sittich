@@ -1,14 +1,5 @@
 #!/bin/sh
 
-# Environment variables:
-#   API_URL   - transcription endpoint, e.g. http://localhost:5092/transcribe
-#   API_OPTS  - optional extra curl form fields, e.g. -F chunk_size=45 -F format=text
-#   CURL_OPTS - optional extra curl flags
-#
-# This script expects voicemail emails with a single WAV attachment and sends the
-# decoded WAV to the local sittich HTTP API using multipart upload:
-#   curl -X POST "$API_URL" -F file=@stream.part3.wav
-
 set -eu
 
 API_URL="${API_URL:-https://localhost:5092/transcribe}"
@@ -28,51 +19,50 @@ cd "$TMPDIR"
 
 cat > stream.org
 
+if grep -iq '^X-Sittich-Processed: true' stream.org; then
+	sendmail -t < stream.org
+	exit 0
+fi
+
 BOUNDARY=$(grep -im1 'boundary=' stream.org | sed 's/.*boundary="\{0,1\}\([^";[:space:]]*\).*/\1/')
 
 if [ -z "$BOUNDARY" ]; then
-	mv stream.org stream.new
+	sed '1a X-Sittich-Processed: true' stream.org > stream.new
 else
 	awk '/'"$BOUNDARY"'/{i++}{print > "stream.part"i}' stream.org
 
 	if [ ! -f stream.part3 ]; then
-		mv stream.org stream.new
+		sed '1a X-Sittich-Processed: true' stream.org > stream.new
 	else
-		sed '7,$d' stream.part3 > stream.part3.wav.head
-		sed '1,6d' stream.part3 > stream.part3.wav.base64
-
-		tr -d '\r' < stream.part3.wav.base64 > stream.part3.wav.base64.tmp
-		mv stream.part3.wav.base64.tmp stream.part3.wav.base64
-
-		base64 -di stream.part3.wav.base64 > stream.part3.wav
+		sed '1,6d' stream.part3 | tr -d '\r ' | base64 -di > stream.part3.wav
 
 		TRANSCRIPT=""
 		if [ -s stream.part3.wav ]; then
-			if RESPONSE=$(sh -c "curl -sS $CURL_OPTS -X POST \"$API_URL\" -F file=@stream.part3.wav $API_OPTS" 2>curl.err); then
-				TRANSCRIPT=$(printf '%s' "$RESPONSE")
+			CURL_RC=0
+			sh -c "curl -sS $CURL_OPTS -X POST \"$API_URL\" -F file=@stream.part3.wav $API_OPTS" > curl.out 2>curl.err || CURL_RC=$?
+			if [ $CURL_RC -eq 0 ]; then
+				RESPONSE=$(cat curl.out 2>/dev/null || true)
+				TRANSCRIPT=$(printf '%s' "$RESPONSE" | iconv -f UTF-8 -t ISO-8859-1//TRANSLIT)
 			else
-				ERRMSG=$(cat curl.err 2>/dev/null || true)
-				TRANSCRIPT="[transcription failed: ${ERRMSG:-curl request failed}]"
+				TRANSCRIPT=""
 			fi
 		else
-			TRANSCRIPT="[transcription failed: decoded WAV attachment is empty]"
+			TRANSCRIPT=""
 		fi
 
-		mv stream.part stream.new
+		sed '1a X-Sittich-Processed: true' stream.part > stream.new
 		cat stream.part1 >> stream.new
-		sed '$d' < stream.part2 >> stream.new
+		cat stream.part2 >> stream.new
 
-		echo "--- Automated transcription result ---" >> stream.new
-		echo "$TRANSCRIPT" >> stream.new
+		if [ -n "$TRANSCRIPT" ]; then
+			printf '\n\n' >> stream.new
+			echo "--- Transkript ---" >> stream.new
+			echo "$TRANSCRIPT" >> stream.new
+			printf '\n' >> stream.new
+		fi
 
-		tail -1 stream.part2 >> stream.new
 		cat stream.part3 >> stream.new
-
-		printf '\n\n' > stream.tmp
-		cat stream.part4 >> stream.tmp
-		tr -d '\r' < stream.tmp > stream.tmp.clean
-		mv stream.tmp.clean stream.tmp
-		cat stream.tmp >> stream.new
+		tr -d '\r' < stream.part4 >> stream.new
 	fi
 fi
 

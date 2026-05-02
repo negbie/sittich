@@ -20,6 +20,9 @@ type Engine interface {
 	// ModelName returns a human-readable identifier for the loaded model.
 	ModelName() string
 
+	// VADPath returns the path to the VAD model if configured.
+	VADPath() string
+
 	// Close releases all resources held by the engine.
 	Close() error
 }
@@ -33,9 +36,10 @@ type Options struct {
 
 // Result holds the complete output of a transcription run.
 type Result struct {
-	Language string
-	Duration float64
-	Segments []Segment
+	Language   string
+	Duration   float64
+	Confidence float64
+	Segments   []Segment
 }
 
 // FullText concatenates all segment texts separated by spaces.

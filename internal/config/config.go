@@ -1,5 +1,7 @@
 package config
 
+import "time"
+
 // Server holds server configuration.
 type Server struct {
 	ListenAddr       string
@@ -18,11 +20,14 @@ type Server struct {
 type ASR struct {
 	ModelPath      string
 	NumThreads     int
-	MaxActive      int
 	DecodingMethod string
 	MaxActivePaths int
-	Denoise        bool
+	MaxConcurrency int
 	Lazy           bool
+	IdleTimeout    time.Duration
+	VADEnabled     bool
+	VADPath        string
+	DualModel      bool
 }
 
 // Pipeline holds pipeline behaviour.
@@ -41,8 +46,8 @@ type Pipeline struct {
 	// Language is a BCP-47 hint passed to the engine (empty = auto-detect).
 	Language string
 
-	// Denoise enables speech enhancement before transcription.
-	Denoise bool
+	// VADEnabled enables Voice Activity Detection.
+	VADEnabled bool
 
 	// Debug enables detailed console logging.
 	Debug bool

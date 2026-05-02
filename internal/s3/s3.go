@@ -22,7 +22,6 @@ import (
 const DefaultPort = "8080"
 const DefaultHost = "localhost"
 
-// xmlEscape escapes special XML characters in a string
 func xmlEscape(s string) string {
 	var b strings.Builder
 	xml.EscapeText(&b, []byte(s))
@@ -36,10 +35,9 @@ type FileInfo struct {
 }
 
 type ServerConfig struct {
-	DataDir string
-	Port    string
-	Debug   bool
-	// OnUpload is called when a file is successfully uploaded/created.
+	DataDir  string
+	Port     string
+	Debug    bool
 	OnUpload func(bucket, key, localPath string)
 }
 
@@ -52,10 +50,8 @@ type ClientConfig struct {
 type Server struct {
 	config     ServerConfig
 	httpServer *http.Server
-
-	// multipart upload tracking
-	mu      sync.Mutex
-	uploads map[string]*multipartUpload // uploadId -> upload metadata
+	mu         sync.Mutex
+	uploads    map[string]*multipartUpload
 }
 
 type multipartUpload struct {

@@ -1,22 +1,41 @@
 package pipeline
 
+import "fmt"
+
 const frameSize = 640 // 40ms frame at 16kHz
 
 // Chunk represents a slice of audio for engine inference.
 type Chunk struct {
-	Start     float64
-	End       float64
-	OrigStart float64
-	OrigEnd   float64
+	Start     int
+	End       int
+	OrigStart int
+	OrigEnd   int
 }
 
 // ChunkAudioEnergyAware slices audio by finding the quietest moments (lowest RMS)
 // near target boundaries. Split points are snapped to 40ms frame boundaries
 // to prevent artifacts in model encoder states.
-func ChunkAudioEnergyAware(samples []float32, sampleRate int, targetDuration, searchWindow, overlap, padding float64) []Chunk {
+func ChunkAudioEnergyAware(samples []float32, sampleRate int, targetDuration, searchWindow, overlap, padding float64) ([]Chunk, error) {
 	totalSamples := len(samples)
 	if totalSamples == 0 {
-		return nil
+		return nil, nil
+	}
+
+	// Comprehensive input validation with descriptive errors
+	if sampleRate <= 0 {
+		return nil, fmt.Errorf("chunker: invalid sample rate %d", sampleRate)
+	}
+	if targetDuration < 1.0 {
+		targetDuration = 1.0 // Safety floor to prevent nano-chunking OOM
+	}
+	if searchWindow < 1.0 {
+		searchWindow = 1.0
+	}
+	if overlap < 0 || padding < 0 {
+		return nil, fmt.Errorf("chunker: overlap (%.2f) and padding (%.2f) must be >= 0", overlap, padding)
+	}
+	if overlap >= targetDuration {
+		return nil, fmt.Errorf("chunker: overlap (%.2f) must be less than target duration (%.2f)", overlap, targetDuration)
 	}
 
 	targetSamples := int(targetDuration * float64(sampleRate))
@@ -39,7 +58,11 @@ func ChunkAudioEnergyAware(samples []float32, sampleRate int, targetDuration, se
 			}
 
 			if sStart < currentEnd {
-				currentEnd = findQuietestSampleIndex(samples, sampleRate, sStart, currentEnd)
+				idx, err := findQuietestSampleIndex(samples, sampleRate, sStart, currentEnd)
+				if err != nil {
+					return nil, fmt.Errorf("chunker: failed to find split point: %w", err)
+				}
+				currentEnd = idx
 			}
 		}
 
@@ -53,10 +76,10 @@ func ChunkAudioEnergyAware(samples []float32, sampleRate int, targetDuration, se
 		}
 
 		chunks = append(chunks, Chunk{
-			Start:     float64(pStart) / float64(sampleRate),
-			End:       float64(pEnd) / float64(sampleRate),
-			OrigStart: float64(currentStart) / float64(sampleRate),
-			OrigEnd:   float64(currentEnd) / float64(sampleRate),
+			Start:     pStart,
+			End:       pEnd,
+			OrigStart: currentStart,
+			OrigEnd:   currentEnd,
 		})
 
 		if currentEnd >= totalSamples {
@@ -65,21 +88,48 @@ func ChunkAudioEnergyAware(samples []float32, sampleRate int, targetDuration, se
 		
 		nextStart := currentEnd - overlapSamples
 		if nextStart <= currentStart {
+			// Ensured nextStart always advances past currentStart to prevent infinite loops
 			currentStart = currentEnd
 		} else {
 			currentStart = nextStart
 		}
 	}
 
-	return chunks
+	// Eliminate ownership overlaps: split any overlapping OrigStart/OrigEnd
+	// regions at the midpoint so the stitcher never accepts a word from two chunks.
+	for i := 1; i < len(chunks); i++ {
+		if chunks[i].OrigStart < chunks[i-1].OrigEnd {
+			mid := chunks[i].OrigStart + (chunks[i-1].OrigEnd-chunks[i].OrigStart)/2
+			chunks[i-1].OrigEnd = mid
+			chunks[i].OrigStart = mid
+		}
+	}
+
+	return chunks, nil
 }
 
 // findQuietestSampleIndex returns the index of lowest RMS energy in the search
 // region using a sliding window. Result is snapped to a 40ms frame boundary (640 samples).
-func findQuietestSampleIndex(samples []float32, sampleRate int, startIdx, endIdx int) int {
+func findQuietestSampleIndex(samples []float32, sampleRate int, startIdx, endIdx int) (int, error) {
+	// Bounds clamping before array access
+	if startIdx < 0 {
+		startIdx = 0
+	}
+	if endIdx > len(samples) {
+		endIdx = len(samples)
+	}
+	if startIdx >= endIdx {
+		return startIdx, fmt.Errorf("invalid search region: start (%d) >= end (%d)", startIdx, endIdx)
+	}
+
 	windowSize := int(0.1 * float64(sampleRate)) // 100ms
-	if (endIdx - startIdx) <= windowSize {
-		return endIdx
+	if windowSize <= 0 {
+		windowSize = frameSize
+	}
+
+	// Invalid search region: check for minimum region size before searching
+	if (endIdx - startIdx) < windowSize {
+		return endIdx, nil // If region is too small, default to endIdx to avoid cutting words in half
 	}
 
 	var currentSumSq float64
@@ -106,11 +156,11 @@ func findQuietestSampleIndex(samples []float32, sampleRate int, startIdx, endIdx
 	
 	// Failsafe: absolute bounds check.
 	if snapped <= startIdx {
-		return startIdx + frameSize
+		return startIdx + frameSize, nil
 	}
 	if snapped >= endIdx {
-		return endIdx
+		return endIdx, nil
 	}
 
-	return snapped
+	return snapped, nil
 }

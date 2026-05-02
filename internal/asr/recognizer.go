@@ -7,6 +7,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync"
+	"time"
 
 	sherpa "github.com/k2-fsa/sherpa-onnx-go/sherpa_onnx"
 	"github.com/negbie/sittich/internal/config"
@@ -22,20 +23,19 @@ type Recognizer struct {
 	active     int
 	inFlight   int
 	closed     bool
-	maxActive  int // limits concurrent DecodeStreams to cap ONNX arena memory
+	idleTimer  *time.Timer
 }
 
 func NewRecognizer(cfg *config.ASR) (*Recognizer, error) {
 	r := &Recognizer{
-		Config:    cfg,
-		maxActive: cfg.MaxActive,
+		Config: cfg,
 	}
 	r.cond = sync.NewCond(&r.mu)
-
 	if !cfg.Lazy {
 		if err := r.ensureLoaded(); err != nil {
 			return nil, err
 		}
+		r.release()
 	}
 
 	return r, nil
@@ -44,6 +44,14 @@ func NewRecognizer(cfg *config.ASR) (*Recognizer, error) {
 func (r *Recognizer) ensureLoaded() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	if r.closed {
+		return fmt.Errorf("asr: recognizer closed")
+	}
+
+	if r.idleTimer != nil {
+		r.idleTimer.Stop()
+	}
 
 	r.inFlight++
 
@@ -73,6 +81,8 @@ func (r *Recognizer) ensureLoaded() error {
 
 	recognizer := sherpa.NewOfflineRecognizer(&sherpaConfig)
 	if recognizer == nil {
+		r.inFlight--
+		r.cond.Broadcast()
 		return fmt.Errorf("asr: failed to initialize sherpa-onnx")
 	}
 	r.recognizer = recognizer
@@ -103,57 +113,65 @@ func (r *Recognizer) TranscribeBatch(ctx context.Context, chunks [][]float32, sa
 	}
 	defer r.release()
 
-	limit := r.maxActive
-	if limit < 1 {
-		limit = 1
-	}
+	// Ensure cond.Wait() unblocks when context is cancelled.
+	ctxDone := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			r.cond.Broadcast()
+		case <-ctxDone:
+		}
+	}()
+	defer close(ctxDone)
 
 	results := make([]*Result, len(chunks))
 
-	for i := 0; i < len(chunks); i += limit {
-		end := i + limit
-		if end > len(chunks) {
-			end = len(chunks)
+	for i, chunk := range chunks {
+		if err := ctx.Err(); err != nil {
+			return nil, err
 		}
-		currentBatch := chunks[i:end]
-		batchLen := len(currentBatch)
 
 		r.mu.Lock()
-		for r.active+batchLen > limit {
+		maxActive := r.Config.MaxConcurrency
+		if maxActive <= 0 {
+			maxActive = 1
+		}
+		for r.active >= maxActive && !r.closed && ctx.Err() == nil {
 			r.cond.Wait()
 		}
 		if r.closed {
 			r.mu.Unlock()
 			return nil, fmt.Errorf("asr: recognizer closed")
 		}
-		r.active += batchLen
+		if err := ctx.Err(); err != nil {
+			r.mu.Unlock()
+			return nil, err
+		}
+		r.active++
 		r.mu.Unlock()
 
-		streams := make([]*sherpa.OfflineStream, batchLen)
-		for j, chunk := range currentBatch {
+		err := func() error {
 			s := sherpa.NewOfflineStream(r.recognizer)
 			if s == nil {
-				for _, st := range streams[:j] {
-					sherpa.DeleteOfflineStream(st)
-				}
-				r.mu.Lock()
-				r.active -= batchLen
-				r.cond.Broadcast()
-				r.mu.Unlock()
-				return nil, fmt.Errorf("asr: failed to create stream")
+				return fmt.Errorf("asr: failed to create stream")
 			}
+			defer sherpa.DeleteOfflineStream(s)
+
 			s.AcceptWaveform(sampleRate, chunk)
-			streams[j] = s
-		}
+			r.recognizer.DecodeStreams([]*sherpa.OfflineStream{s})
 
-		r.recognizer.DecodeStreams(streams)
-
-		for j, s := range streams {
 			res := s.GetResult()
-			duration := float64(len(currentBatch[j])) / float64(sampleRate)
+			duration := float64(len(chunk)) / float64(sampleRate)
 
 			out := &Result{Duration: duration}
 			if res != nil {
+				if len(res.YsLogProbs) > 0 {
+					var sum float64
+					for _, p := range res.YsLogProbs {
+						sum += float64(p)
+					}
+					out.Confidence = sum / float64(len(res.YsLogProbs))
+				}
 				cleanText := strings.ReplaceAll(res.Text, "\u2581", " ")
 				seg := Segment{
 					End:  duration,
@@ -178,14 +196,18 @@ func (r *Recognizer) TranscribeBatch(ctx context.Context, chunks [][]float32, sa
 				}
 				out.Segments = []Segment{seg}
 			}
-			results[i+j] = out
-			sherpa.DeleteOfflineStream(s)
-		}
+			results[i] = out
+			return nil
+		}()
 
 		r.mu.Lock()
-		r.active -= batchLen
+		r.active--
 		r.cond.Broadcast()
 		r.mu.Unlock()
+
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	return results, nil
@@ -196,12 +218,22 @@ func (r *Recognizer) release() {
 	defer r.mu.Unlock()
 
 	r.inFlight--
-
-	if !r.Config.Lazy {
-		return
-	}
+	r.cond.Broadcast()
 
 	if r.inFlight == 0 && r.recognizer != nil {
+		if r.Config.Lazy {
+			r.unload()
+		} else if r.Config.IdleTimeout > 0 {
+			if r.idleTimer != nil {
+				r.idleTimer.Stop()
+			}
+			r.idleTimer = time.AfterFunc(r.Config.IdleTimeout, r.onIdleTimeout)
+		}
+	}
+}
+
+func (r *Recognizer) unload() {
+	if r.recognizer != nil {
 		sherpa.DeleteOfflineRecognizer(r.recognizer)
 		r.recognizer = nil
 		// Return both Go and C++ heap memory to the OS immediately.
@@ -210,8 +242,17 @@ func (r *Recognizer) release() {
 	}
 }
 
+func (r *Recognizer) onIdleTimeout() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.inFlight == 0 && !r.closed {
+		r.unload()
+	}
+}
+
 func (r *Recognizer) SupportedLanguages() []string { return nil }
 func (r *Recognizer) ModelName() string            { return filepath.Base(r.Config.ModelPath) }
+func (r *Recognizer) VADPath() string              { return r.Config.VADPath }
 
 func (r *Recognizer) Close() error {
 	if r == nil {
@@ -223,7 +264,11 @@ func (r *Recognizer) Close() error {
 		return nil
 	}
 	r.closed = true
-	for r.active > 0 {
+	if r.idleTimer != nil {
+		r.idleTimer.Stop()
+	}
+	r.cond.Broadcast()
+	for r.inFlight > 0 {
 		r.cond.Wait()
 	}
 	if r.recognizer != nil {

@@ -12,69 +12,26 @@ import (
 )
 
 const (
-	DefaultModelName = "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8"
-	ModelURL         = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8.tar.bz2"
-
-	EncoderFile = "encoder.int8.onnx"
-	DecoderFile = "decoder.int8.onnx"
-	JoinerFile  = "joiner.int8.onnx"
-	TokensFile  = "tokens.txt"
-
-	DenoiserFile = "gtcrn_simple.onnx"
-	DenoiserURL  = "https://github.com/k2-fsa/sherpa-onnx/releases/download/speech-enhancement-models/gtcrn_simple.onnx"
+	ModelURL     = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8.tar.bz2"
+	NemoModelURL = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-transducer-stt_de_fastconformer_hybrid_large_pc-int8.tar.bz2"
+	EncoderFile  = "encoder.int8.onnx"
+	DecoderFile  = "decoder.int8.onnx"
+	JoinerFile   = "joiner.int8.onnx"
+	TokensFile   = "tokens.txt"
+	VADFile      = "silero_vad.onnx"
+	SileroVADURL = "https://huggingface.co/istupakov/silero-vad-onnx/resolve/main/silero_vad_16k_op15.onnx?download=true"
 )
 
 var requiredModelFiles = []string{EncoderFile, DecoderFile, JoinerFile, TokensFile}
 
-// downloadFile downloads a single file from url to path
-func downloadFile(url, path string) error {
-	resp, err := http.Get(url)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("download failed: %s", resp.Status)
-	}
-
-	tmpPath := path + ".part"
-	out, err := os.Create(tmpPath)
-	if err != nil {
-		return err
-	}
-
-	if _, err := io.Copy(out, resp.Body); err != nil {
-		out.Close()
-		os.Remove(tmpPath)
-		return err
-	}
-
-	if err := out.Close(); err != nil {
-		os.Remove(tmpPath)
-		return err
-	}
-
-	if err := os.Rename(tmpPath, path); err != nil {
-		os.Remove(tmpPath)
-		return err
-	}
-
-	return nil
-}
-
-// GetModelPath returns the path to the model directory, downloading if necessary.
-// If dataDir is empty, it defaults to "./data".
-func GetModelPath(dataDir string) (string, error) {
+func GetModelPath(dataDir, url string) (string, error) {
 	if dataDir == "" {
 		dataDir = "./data"
 	}
 
-	// 1. Check if model is already in dataDir
 	if !isValidModel(dataDir) {
-		// 2. Download model to dataDir
-		fmt.Fprintf(os.Stderr, "Downloading base model to %s...\n", dataDir)
-		if err := downloadAndExtract(dataDir); err != nil {
+		fmt.Fprintf(os.Stderr, "Downloading model to %s...\n", dataDir)
+		if err := downloadAndExtract(dataDir, url); err != nil {
 			return "", fmt.Errorf("failed to download model: %w", err)
 		}
 	}
@@ -82,27 +39,21 @@ func GetModelPath(dataDir string) (string, error) {
 	return dataDir, nil
 }
 
-// GetDenoiserPath returns the path to the denoiser model, downloading if necessary.
-func GetDenoiserPath(dataDir string) (string, error) {
+func GetVADPath(dataDir string) (string, error) {
 	if dataDir == "" {
-		dataDir = "./data"
+		dataDir = "./data/vad"
 	}
+	targetPath := filepath.Join(dataDir, VADFile)
 
-	path := filepath.Join(dataDir, DenoiserFile)
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		fmt.Fprintf(os.Stderr, "Downloading denoiser model to %s...\n", path)
-		if err := os.MkdirAll(dataDir, 0755); err != nil {
-			return "", err
-		}
-		if err := downloadFile(DenoiserURL, path); err != nil {
-			return "", fmt.Errorf("failed to download denoiser: %w", err)
+	if _, err := os.Stat(targetPath); err != nil {
+		fmt.Fprintf(os.Stderr, "Downloading VAD model to %s...\n", targetPath)
+		if err := downloadToFile(targetPath, SileroVADURL); err != nil {
+			return "", fmt.Errorf("failed to download VAD model: %w", err)
 		}
 	}
 
-	return path, nil
+	return targetPath, nil
 }
-
-
 
 func isValidModel(path string) bool {
 	for _, file := range requiredModelFiles {
@@ -113,7 +64,7 @@ func isValidModel(path string) bool {
 	return true
 }
 
-func downloadAndExtract(targetDir string) error {
+func downloadAndExtract(targetDir, url string) error {
 	if err := os.MkdirAll(filepath.Dir(targetDir), 0755); err != nil {
 		return err
 	}
@@ -125,58 +76,9 @@ func downloadAndExtract(targetDir string) error {
 	tmpPath := tmpFile.Name()
 	defer os.Remove(tmpPath)
 
-	resp, err := http.Get(ModelURL)
-	if err != nil {
-		tmpFile.Close()
+	if err := download(tmpFile, url); err != nil {
 		return err
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		tmpFile.Close()
-		return fmt.Errorf("download failed: %s", resp.Status)
-	}
-
-	// Download with single-line progress bar
-	size := resp.ContentLength
-	written := int64(0)
-	buf := make([]byte, 64*1024)
-	lastPercent := -1
-
-	for {
-		nr, rerr := resp.Body.Read(buf)
-		if nr > 0 {
-			nw, werr := tmpFile.Write(buf[:nr])
-			if nw > 0 {
-				written += int64(nw)
-			}
-			if werr != nil {
-				tmpFile.Close()
-				return werr
-			}
-			// Update progress every 5%
-			if size > 0 {
-				percent := int(float64(written) * 100 / float64(size))
-				if percent != lastPercent && percent%5 == 0 {
-					mb := float64(written) / (1024 * 1024)
-					totalMb := float64(size) / (1024 * 1024)
-					fmt.Fprintf(os.Stderr, "\r  Downloading: %.1f / %.1f MB (%d%%)", mb, totalMb, percent)
-					lastPercent = percent
-				}
-			}
-		}
-		if rerr == io.EOF {
-			break
-		}
-		if rerr != nil {
-			tmpFile.Close()
-			return rerr
-		}
-	}
-	if err := tmpFile.Close(); err != nil {
-		return err
-	}
-	fmt.Fprintln(os.Stderr) // New line after progress
 
 	stagingDir := targetDir + ".tmp"
 	_ = os.RemoveAll(stagingDir)
@@ -203,6 +105,75 @@ func downloadAndExtract(targetDir string) error {
 	}
 
 	fmt.Fprintf(os.Stderr, "Model ready\n")
+	return nil
+}
+
+func downloadToFile(targetPath, url string) error {
+	if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
+		return err
+	}
+
+	f, err := os.Create(targetPath + ".tmp")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(f.Name())
+
+	if err := download(f, url); err != nil {
+		f.Close()
+		return err
+	}
+	f.Close()
+
+	return os.Rename(f.Name(), targetPath)
+}
+
+func download(w io.WriteSeeker, url string) error {
+	resp, err := http.Get(url)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("download failed: %s", resp.Status)
+	}
+
+	// Download with single-line progress bar
+	size := resp.ContentLength
+	written := int64(0)
+	buf := make([]byte, 64*1024)
+	lastPercent := -1
+
+	for {
+		nr, rerr := resp.Body.Read(buf)
+		if nr > 0 {
+			nw, werr := w.Write(buf[:nr])
+			if nw > 0 {
+				written += int64(nw)
+			}
+			if werr != nil {
+				return werr
+			}
+			// Update progress every 5%
+			if size > 0 {
+				percent := int(float64(written) * 100 / float64(size))
+				if percent != lastPercent && percent%5 == 0 {
+					mb := float64(written) / (1024 * 1024)
+					totalMb := float64(size) / (1024 * 1024)
+					fmt.Fprintf(os.Stderr, "\r  Downloading: %.1f / %.1f MB (%d%%)", mb, totalMb, percent)
+					lastPercent = percent
+				}
+			}
+		}
+		if rerr == io.EOF {
+			break
+		}
+		if rerr != nil {
+			return rerr
+		}
+	}
+	fmt.Fprintln(os.Stderr) // New line after progress
 	return nil
 }
 

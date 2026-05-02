@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -15,33 +16,35 @@ import (
 	"strings"
 	"time"
 
+	"crypto/tls"
+	"mime/multipart"
+
 	"github.com/negbie/sittich/internal/asr"
 	"github.com/negbie/sittich/internal/config"
 	"github.com/negbie/sittich/internal/models"
 	"github.com/negbie/sittich/internal/output"
 	"github.com/negbie/sittich/internal/pipeline"
-	"mime/multipart"
 )
 
 // Server provides the HTTP interface for transcription.
 type Server struct {
 	httpServer *http.Server
 	mux        *http.ServeMux
+	ctx        context.Context
 	engine     asr.Engine
 	options    *config.Server
 	pipeline   config.Pipeline
-	denoiser   *asr.Denoiser
 	sem        chan struct{}
 	version    string
 	startTime  time.Time
 }
 
-func NewServer(options *config.Server, pipeline config.Pipeline, engine asr.Engine, denoiser *asr.Denoiser, version string) *Server {
+func NewServer(ctx context.Context, options *config.Server, pipeline config.Pipeline, engine asr.Engine, version string) *Server {
 	s := &Server{
+		ctx:       ctx,
 		engine:    engine,
 		options:   options,
 		pipeline:  pipeline,
-		denoiser:  denoiser,
 		sem:       make(chan struct{}, options.Workers),
 		version:   version,
 		startTime: time.Now(),
@@ -54,6 +57,9 @@ func NewServer(options *config.Server, pipeline config.Pipeline, engine asr.Engi
 	s.httpServer = &http.Server{
 		Addr:    options.ListenAddr,
 		Handler: s.withMiddleware(s.mux),
+		BaseContext: func(_ net.Listener) context.Context {
+			return s.ctx
+		},
 	}
 
 	return s
@@ -151,7 +157,7 @@ func (s *Server) processLocalTranscribe(w http.ResponseWriter, r *http.Request) 
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
 	defer cancel()
 
-	result, err := s.ProcessTranscribe(ctx, filePath, format, chunkSize, soxFlags)
+	result, err := s.transcribeLocal(ctx, filePath, chunkSize, soxFlags)
 	if err != nil {
 		s.sendError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -189,9 +195,8 @@ func (s *Server) transcribeLocal(ctx context.Context, filePath string, chunkSize
 	}
 
 	pipe := &pipeline.Pipeline{
-		Engine:   s.engine,
-		Denoiser: s.denoiser,
-		Config:   s.pipeline,
+		Engine: s.engine,
+		Config: s.pipeline,
 	}
 
 	return pipe.Process(ctx, filePath, float64(chunkSize), soxFlags...)
@@ -212,21 +217,25 @@ func (s *Server) transcribeWithProxy(ctx context.Context, filePath string, forma
 }
 
 func (s *Server) proxyRequest(w http.ResponseWriter, r *http.Request, targetURL string) {
+	if !strings.HasPrefix(targetURL, "http") {
+		targetURL = "http://" + targetURL
+	}
 	target, err := url.Parse(targetURL)
 	if err != nil {
 		s.sendError(w, http.StatusInternalServerError, fmt.Sprintf("invalid proxy target: %v", err))
 		return
 	}
 
-	proxy := &httputil.ReverseProxy{
-		Director: func(req *http.Request) {
-			req.URL.Scheme = target.Scheme
-			req.URL.Host = target.Host
-			req.URL.Path = target.Path
-			req.URL.RawQuery = target.RawQuery
-			req.Host = target.Host
-			req.Header.Set("X-Sittich-Proxy-Loop", "true")
-		},
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	proxy.Transport = &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}
+
+	originalDirector := proxy.Director
+	proxy.Director = func(req *http.Request) {
+		originalDirector(req)
+		req.Header.Set("X-Sittich-Proxy-Loop", "true")
+		req.Host = target.Host
 	}
 
 	proxy.ServeHTTP(w, r)
@@ -250,9 +259,13 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) parseRequest(r *http.Request) (filePath, format string, chunkSize int, soxFlags []string, cleanup func(), err error) {
 	format = s.options.DefaultFormat
-	if format == "" { format = "text" }
+	if format == "" {
+		format = "text"
+	}
 	chunkSize = s.options.DefaultChunkSize
-	if chunkSize <= 0 { chunkSize = 40 }
+	if chunkSize <= 0 {
+		chunkSize = 40
+	}
 
 	contentType := r.Header.Get("Content-Type")
 
@@ -280,12 +293,18 @@ func (s *Server) parseRequest(r *http.Request) (filePath, format string, chunkSi
 		tmpFile.Close()
 		filePath = tmpFile.Name()
 
-		if f := r.FormValue("format"); f != "" { format = strings.ToLower(f) }
+		if f := r.FormValue("format"); f != "" {
+			format = strings.ToLower(f)
+		}
 		if c := r.FormValue("chunk_size"); c != "" {
-			if n, err := strconv.Atoi(c); err == nil && n > 0 { chunkSize = n }
+			if n, err := strconv.Atoi(c); err == nil && n > 0 {
+				chunkSize = n
+			}
 		}
 		if sf := r.MultipartForm.Value["sox_flags"]; len(sf) > 0 {
-			for _, f := range sf { soxFlags = append(soxFlags, strings.Fields(f)...) }
+			for _, f := range sf {
+				soxFlags = append(soxFlags, strings.Fields(f)...)
+			}
 		}
 
 		cleanup = func() { os.Remove(filePath) }
@@ -298,13 +317,19 @@ func (s *Server) parseRequest(r *http.Request) (filePath, format string, chunkSi
 
 		if req.URL != "" {
 			filePath, err = s.downloadFromURL(req.URL)
-			if err != nil { return "", "", 0, nil, nil, err }
+			if err != nil {
+				return "", "", 0, nil, nil, err
+			}
 		} else if req.Base64 != "" {
 			data, err := base64.StdEncoding.DecodeString(req.Base64)
-			if err != nil { return "", "", 0, nil, nil, fmt.Errorf("invalid base64: %w", err) }
+			if err != nil {
+				return "", "", 0, nil, nil, fmt.Errorf("invalid base64: %w", err)
+			}
 
 			tmpFile, err := os.CreateTemp("", "sittich-b64-*")
-			if err != nil { return "", "", 0, nil, nil, fmt.Errorf("failed to create temp file: %w", err) }
+			if err != nil {
+				return "", "", 0, nil, nil, fmt.Errorf("failed to create temp file: %w", err)
+			}
 
 			tmpFile.Write(data)
 			tmpFile.Close()
@@ -313,10 +338,16 @@ func (s *Server) parseRequest(r *http.Request) (filePath, format string, chunkSi
 			return "", "", 0, nil, nil, fmt.Errorf("missing url or base64 in request")
 		}
 
-		if req.Format != "" { format = strings.ToLower(req.Format) }
-		if req.ChunkSize > 0 { chunkSize = req.ChunkSize }
+		if req.Format != "" {
+			format = strings.ToLower(req.Format)
+		}
+		if req.ChunkSize > 0 {
+			chunkSize = req.ChunkSize
+		}
 		if len(req.SoxFlags) > 0 {
-			for _, f := range req.SoxFlags { soxFlags = append(soxFlags, strings.Fields(f)...) }
+			for _, f := range req.SoxFlags {
+				soxFlags = append(soxFlags, strings.Fields(f)...)
+			}
 		}
 
 		cleanup = func() { os.Remove(filePath) }
@@ -326,7 +357,9 @@ func (s *Server) parseRequest(r *http.Request) (filePath, format string, chunkSi
 	}
 
 	if format != "text" && format != "json" && format != "vtt" {
-		if filePath != "" { os.Remove(filePath) }
+		if filePath != "" {
+			os.Remove(filePath)
+		}
 		return "", "", 0, nil, nil, fmt.Errorf("invalid format: %s (must be text, json, or vtt)", format)
 	}
 
@@ -335,14 +368,20 @@ func (s *Server) parseRequest(r *http.Request) (filePath, format string, chunkSi
 
 func (s *Server) downloadFromURL(url string) (string, error) {
 	resp, err := http.Get(url)
-	if err != nil { return "", fmt.Errorf("failed to download: %w", err) }
+	if err != nil {
+		return "", fmt.Errorf("failed to download: %w", err)
+	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK { return "", fmt.Errorf("download failed: %s", resp.Status) }
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("download failed: %s", resp.Status)
+	}
 
 	maxBytes := s.options.MaxUploadMB * 1024 * 1024
 	tmpFile, err := os.CreateTemp("", "sittich-url-*")
-	if err != nil { return "", fmt.Errorf("failed to create temp file: %w", err) }
+	if err != nil {
+		return "", fmt.Errorf("failed to create temp file: %w", err)
+	}
 
 	written, err := io.Copy(tmpFile, io.LimitReader(resp.Body, maxBytes+1))
 	tmpFile.Close()
@@ -431,7 +470,12 @@ func (s *Server) doProxyPOST(ctx context.Context, targetURL, filePath, format st
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 	req.Header.Set("X-Sittich-Proxy-Loop", "true")
 
-	resp, err := http.DefaultClient.Do(req)
+	client := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -457,28 +501,52 @@ func (s *Server) doProxyPOST(ctx context.Context, targetURL, filePath, format st
 	}, nil
 }
 
-func LoadRecognizer(cfg *config.ASR) (*asr.Recognizer, error) {
-	modelPath, err := models.GetModelPath(cfg.ModelPath)
-	if err != nil { return nil, fmt.Errorf("failed to get model: %w", err) }
-
-	if cfg == nil {
-		cfg = &config.ASR{ModelPath: modelPath}
-	} else {
-		cfg.ModelPath = modelPath
+func LoadRecognizer(cfg *config.ASR) (asr.Engine, error) {
+	baseDir := cfg.ModelPath
+	if baseDir == "" {
+		baseDir = "./data"
 	}
-
-	return asr.NewRecognizer(cfg)
-}
-
-func LoadDenoiser(cfg *config.ASR) (*asr.Denoiser, error) {
-	if !cfg.Denoise {
-		return nil, nil
-	}
-
-	denoiserPath, err := models.GetDenoiserPath(cfg.ModelPath)
+ 
+	parakeetFolder := filepath.Join(baseDir, "parakeet")
+	parakeetPath, err := models.GetModelPath(parakeetFolder, models.ModelURL)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get denoiser model: %w", err)
+		return nil, fmt.Errorf("failed to resolve parakeet model: %w", err)
 	}
-
-	return asr.NewDenoiser(denoiserPath, cfg.NumThreads, cfg.Lazy)
+ 
+	if cfg.VADEnabled {
+		vadFolder := filepath.Join(baseDir, "vad")
+		vadPath, err := models.GetVADPath(vadFolder)
+		if err != nil {
+			return nil, fmt.Errorf("failed to resolve VAD model: %w", err)
+		}
+		cfg.VADPath = vadPath
+	}
+ 
+	pCfg := *cfg
+	pCfg.ModelPath = parakeetPath
+	engParakeet, err := asr.NewRecognizer(&pCfg)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load parakeet: %w", err)
+	}
+ 
+	if !cfg.DualModel {
+		return engParakeet, nil
+	}
+ 
+	nemoFolder := filepath.Join(baseDir, "nemo")
+	nemoPath, err := models.GetModelPath(nemoFolder, models.NemoModelURL)
+	if err != nil {
+		engParakeet.Close()
+		return nil, fmt.Errorf("failed to resolve nemo model: %w", err)
+	}
+ 
+	nCfg := *cfg
+	nCfg.ModelPath = nemoPath
+	engNemo, err := asr.NewRecognizer(&nCfg)
+	if err != nil {
+		engParakeet.Close()
+		return nil, fmt.Errorf("failed to load nemo: %w", err)
+	}
+ 
+	return asr.NewVoter(engParakeet, engNemo), nil
 }

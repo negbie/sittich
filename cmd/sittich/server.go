@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/negbie/sittich/internal/asr"
 	"github.com/negbie/sittich/internal/config"
 	"github.com/negbie/sittich/internal/s3"
 	"github.com/negbie/sittich/internal/server"
@@ -27,22 +26,11 @@ func runServer(opts *cliOptions) error {
 	}
 	defer recognizer.Close()
 
-	denoiser, err := server.LoadDenoiser(asrCfg)
-	if err != nil {
-		return err
-	}
-	if denoiser != nil {
-		defer denoiser.Close()
-	}
-
-	dispatcher := asr.NewDispatcher(recognizer, opts.MaxActiveStreams, opts.Debug)
-	defer dispatcher.Close()
-
 	pipeCfg := config.Pipeline{
 		ChunkDuration:        float64(opts.ChunkSize),
 		ChunkOverlapDuration: opts.ChunkOverlapDuration,
 		WordTimestamps:       true,
-		Denoise:              opts.Denoise,
+		VADEnabled:           opts.VAD,
 		Debug:                opts.Debug,
 	}
 
@@ -62,7 +50,7 @@ func runServer(opts *cliOptions) error {
 
 	serverCfg := &config.Server{
 		ListenAddr:       opts.ListenAddr,
-		Workers:          opts.MaxActiveStreams,
+		Workers:          opts.MaxConcurrency,
 		MaxUploadMB:      int64(opts.MaxUploadMB),
 		DefaultFormat:    opts.Format,
 		DefaultChunkSize: opts.ChunkSize,
@@ -73,10 +61,10 @@ func runServer(opts *cliOptions) error {
 		DisableHTTPS:     opts.DisableHTTPS,
 	}
 
-	srv := server.NewServer(serverCfg, pipeCfg, dispatcher, denoiser, version)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	srv := server.NewServer(ctx, serverCfg, pipeCfg, recognizer, version)
 
 	go func() {
 		if opts.Lazy {
@@ -90,8 +78,8 @@ func runServer(opts *cliOptions) error {
 			protocol = "http"
 		}
 
-		fmt.Fprintf(os.Stderr, "   Concurrency: workers=%d dispatcher=%d max_active=%d threads=%d\n",
-			opts.MaxActiveStreams, opts.MaxActiveStreams, opts.MaxActiveStreams, opts.NumThreads)
+		fmt.Fprintf(os.Stderr, "   Concurrency: workers=%d threads=%d\n",
+			serverCfg.Workers, opts.NumThreads)
 		fmt.Fprintf(os.Stderr, "   Server running on %s://%s\n", protocol, opts.ListenAddr)
 		fmt.Fprintf(os.Stderr, "   POST /transcribe - Transcription endpoint (Proxy-aware)\n")
 		fmt.Fprintf(os.Stderr, "   GET  /health     - Health check\n")
@@ -106,10 +94,10 @@ func runServer(opts *cliOptions) error {
 					}
 
 					fmt.Fprintf(os.Stderr, "[S3] Job start: bucket=%s key=%s\n", bucket, key)
-					ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+					jobCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 					defer cancel()
 
-					result, err := srv.ProcessTranscribe(ctx, localPath, opts.Format, opts.ChunkSize, nil)
+					result, err := srv.ProcessTranscribe(jobCtx, localPath, opts.Format, opts.ChunkSize, nil)
 					if err != nil {
 						fmt.Fprintf(os.Stderr, "[S3] Job failed: bucket=%s key=%s err=%v\n", bucket, key, err)
 						return
@@ -136,11 +124,11 @@ func runServer(opts *cliOptions) error {
 		}
 	}()
 
-	<-stop
+	<-ctx.Done()
 	fmt.Fprintf(os.Stderr, "\n Shutting down...\n")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	return srv.Shutdown(ctx)
+	return srv.Shutdown(shutdownCtx)
 }

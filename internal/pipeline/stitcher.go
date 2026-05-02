@@ -1,21 +1,21 @@
 package pipeline
 
 import (
+	"math"
 	"sort"
 	"strings"
 
 	"github.com/negbie/sittich/internal/asr"
 )
 
-// ChunkResult pairs an engine transcription result with its original offset.
 type ChunkResult struct {
-	Offset    float64
-	OrigStart float64
-	OrigEnd   float64
+	Offset    int
+	OrigStart int
+	OrigEnd   int
 	Result    *asr.Result
 }
 
-func StitchResults(chunks []ChunkResult, padding float64, debug bool) *asr.Result {
+func StitchResults(chunks []ChunkResult, sampleRate int) *asr.Result {
 	if len(chunks) == 0 {
 		return &asr.Result{}
 	}
@@ -28,80 +28,102 @@ func StitchResults(chunks []ChunkResult, padding float64, debug bool) *asr.Resul
 		}
 	}
 
+	// Collect words with absolute timestamps, filtered by ownership windows.
 	allWords := make([]asr.Word, 0)
-
 	for i, cr := range chunks {
 		if cr.Result == nil {
 			continue
 		}
 
-		rawWords := make([]asr.Word, 0)
 		for _, seg := range cr.Result.Segments {
-			rawWords = append(rawWords, seg.Words...)
-		}
+			for _, w := range seg.Words {
+				offsetSec := float64(cr.Offset) / float64(sampleRate)
+				absStart := w.Start + offsetSec
+				absEnd := w.End + offsetSec
 
-		for _, w := range rawWords {
-			absStart := w.Start + cr.Offset
-			absEnd := w.End + cr.Offset
-			mid := absStart + (absEnd-absStart)/2
+				wStartSamples := int(math.Round(w.Start * float64(sampleRate)))
+				wEndSamples := int(math.Round(w.End * float64(sampleRate)))
+				midSamples := cr.Offset + wStartSamples + (wEndSamples-wStartSamples)/2
 
-			isFirst := i == 0
-			isLast := i == len(chunks)-1
+				isFirst := i == 0
+				isLast := i == len(chunks) - 1
 
-			inWindow := mid >= cr.OrigStart && mid < cr.OrigEnd
+				inWindow := midSamples >= cr.OrigStart && midSamples < cr.OrigEnd
+				if isFirst && midSamples < cr.OrigEnd {
+					inWindow = true
+				}
+				if isLast && midSamples >= cr.OrigStart {
+					inWindow = true
+				}
 
-			// Defensive guards for absolute file boundaries (first and last chunks).
-			if isFirst && mid < cr.OrigEnd {
-				inWindow = true
-			}
-			if isLast && mid >= cr.OrigStart {
-				inWindow = true
-			}
-
-			if inWindow {
-				w.Start = absStart
-				w.End = absEnd
-				allWords = append(allWords, w)
+				if inWindow {
+					w.Start = absStart
+					w.End = absEnd
+					allWords = append(allWords, w)
+				}
 			}
 		}
 	}
 
-	// Safety sort in case chunks or words arrived out of order.
 	sort.Slice(allWords, func(i, j int) bool {
 		return allWords[i].Start < allWords[j].Start
 	})
 
+	// Safety net: remove exact duplicates (same word, same timestamp within 10ms)
+	// that slip through the ownership window filter from overlapping chunks.
+	if len(allWords) > 1 {
+		deduped := allWords[:1]
+		for i := 1; i < len(allWords); i++ {
+			prev := deduped[len(deduped)-1]
+			curr := allWords[i]
+			if math.Abs(curr.Start-prev.Start) < 0.01 && curr.Word == prev.Word {
+				continue
+			}
+			deduped = append(deduped, curr)
+		}
+		allWords = deduped
+	}
+
+	// Split into segments at natural sentence boundaries (gaps > 2s between words).
+	const sentenceGap = 2.0
+	var segments []asr.Segment
+	if len(allWords) > 0 {
+		segStart := 0
+		for i := 1; i <= len(allWords); i++ {
+			if i == len(allWords) || allWords[i].Start-allWords[i-1].End > sentenceGap {
+				segWords := allWords[segStart:i]
+				segments = append(segments, asr.Segment{
+					ID:    len(segments),
+					Text:  cleanTokenText(segWords),
+					Start: segWords[0].Start,
+					End:   segWords[len(segWords)-1].End,
+					Words: segWords,
+				})
+				segStart = i
+			}
+		}
+	}
+
+	return &asr.Result{
+		Language: language,
+		Segments: segments,
+	}
+}
+
+// cleanTokenText joins word tokens into readable text, handling SentencePiece
+// \u2581 space markers, and mutates each word's token to the cleaned form.
+func cleanTokenText(words []asr.Word) string {
 	var builder strings.Builder
-	for i := range allWords {
-		t := allWords[i].Word
-		hasSpace := strings.HasPrefix(t, "\u2581")
-		cleanToken := strings.TrimPrefix(t, "\u2581")
+	for i := range words {
+		hasSpace := strings.HasPrefix(words[i].Word, "\u2581")
+		cleanToken := strings.TrimPrefix(words[i].Word, "\u2581")
 
 		if hasSpace && i > 0 {
 			builder.WriteString(" ")
 		}
 		builder.WriteString(cleanToken)
 
-		// Update the word in the list for the final result metadata.
-		allWords[i].Word = cleanToken
+		words[i].Word = cleanToken
 	}
-
-	var start, end float64
-	if len(allWords) > 0 {
-		start = allWords[0].Start
-		end = allWords[len(allWords)-1].End
-	}
-
-	return &asr.Result{
-		Language: language,
-		Segments: []asr.Segment{
-			{
-				ID:    0,
-				Text:  strings.TrimSpace(builder.String()),
-				Start: start,
-				End:   end,
-				Words: allWords,
-			},
-		},
-	}
+	return strings.TrimSpace(builder.String())
 }

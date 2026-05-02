@@ -179,7 +179,7 @@ func main() {
 }
 
 func generateSearchSpace() [][]string {
-	durations := []string{"0.05", "0.1", "0.3", "0.5"}
+	durations := []string{"0.05", "0.1", "0.3"}
 	percents := []string{"0.1%", "0.5%", "1%"}
 
 	var space [][]string
@@ -191,12 +191,12 @@ func generateSearchSpace() [][]string {
 			space = append(space, silence)
 
 			// 2. gain -h at front
-			front := append([]string{"gain", "-h"}, silence...)
+			front := append([]string{"gain", "-n", "-3"}, silence...)
 			space = append(space, front)
 
 			// 3. gain -h at end
 			end := append([]string{}, silence...)
-			end = append(end, "gain", "-h")
+			end = append(end, "gain", "-n", "-3")
 			space = append(space, end)
 		}
 	}
